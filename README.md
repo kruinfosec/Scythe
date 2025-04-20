@@ -50,3 +50,19 @@ Reporting & Documentation:
 │   └── /collaboration       # (Future) Collaboration features
 ├── /tests                   # Unit and integration tests
 └── /docs                    # Design documents and additional documentation
+
+# Minimum Specs (runs all features, but slower AI inference):
+ - CPU: 4-core (e.g., Intel i5-8250U / Ryzen 5 2500U)
+ - RAM: 8 GB
+ - GPU: 4 GB VRAM (e.g., GTX 1050 Ti / MX450) or CPU fallback
+ - Disk: 10 GB free (for tools, AI models, session logs)
+ - OS: 64-bit Linux with GTK+ 3, VTE, Python 3.8+, bash
+# Recommended Specs (for smooth multiterminal use + fast AI):
+ - CPU: 6-core or better (e.g., i5-11400H / Ryzen 5 5600)
+ - RAM: 16 GB
+ - GPU: 6–8 GB VRAM (e.g., RTX 3060, RX 6600)
+ - Disk: 20+ GB free
+ - OS: Latest Linux (Ubuntu 22.04+ / Arch / Fedora)
+
+# To set OpenAI API key as an environment variable:
+ - export OPENAI_API_KEY="your-api-key"

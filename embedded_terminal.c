@@ -7,7 +7,13 @@
 #include <json-glib/json-glib.h>
 #include <glib-object.h>
 
-// Forward declarations
+// Define a struct to hold pointers to GtkEntry and GtkTextView widgets
+typedef struct {
+    GtkEntry *entry;
+    GtkTextView *text_view;
+} AiWidgets;
+
+// Forward declarations of functions
 static void spawn_shell(VteTerminal *terminal);
 static void close_tab(GtkWidget *widget, gpointer data);
 static void split_terminal_horizontal(GtkWidget *widget, gpointer data);
@@ -22,11 +28,7 @@ static GtkWidget* create_dropdown_menu(GtkWidget *button, const char *menu_items
 static void send_ai_message(GtkWidget *widget, gpointer user_data);
 static gboolean update_text_view(gchar *message, GtkTextView *text_view);
 
-typedef struct {
-    GtkEntry *entry;
-    GtkTextView *text_view;
-} AiWidgets;
-
+// Function to update the text view with a message
 static gboolean update_text_view(gchar *message, GtkTextView *text_view) {
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(text_view);
     gtk_text_buffer_set_text(buffer, message, -1);
@@ -34,6 +36,7 @@ static gboolean update_text_view(gchar *message, GtkTextView *text_view) {
     return FALSE;
 }
 
+// Callback function for AI response
 static void ai_response_callback(SoupSession *session, SoupMessage *msg, gpointer user_data) {
     if (!SOUP_IS_SESSION(session) || !SOUP_IS_MESSAGE(msg)) {
         g_critical("Invalid SoupSession or SoupMessage object.");
@@ -79,6 +82,7 @@ static void ai_response_callback(SoupSession *session, SoupMessage *msg, gpointe
     g_object_unref(parser);
 }
 
+// Function to send a message to the AI
 static void send_ai_message(GtkWidget *widget, gpointer user_data) {
     AiWidgets *widgets = (AiWidgets *)user_data;
     GtkEntry *entry = widgets->entry;
@@ -126,6 +130,7 @@ cleanup:
     g_object_unref(builder);
 }
 
+// Function to spawn a shell in the terminal
 static void spawn_shell(VteTerminal *terminal) {
     const char *shell = g_getenv("SHELL");
     if (!shell) {
@@ -150,6 +155,7 @@ static void spawn_shell(VteTerminal *terminal) {
     );
 }
 
+// Function to close a tab
 static void close_tab(GtkWidget *widget, gpointer data) {
     GtkNotebook *notebook = GTK_NOTEBOOK(data);
     int page = gtk_notebook_get_current_page(notebook);
@@ -158,6 +164,7 @@ static void close_tab(GtkWidget *widget, gpointer data) {
     }
 }
 
+// Function to split the terminal horizontally
 static void split_terminal_horizontal(GtkWidget *widget, gpointer data) {
     GtkWidget *container = GTK_WIDGET(data);
 
@@ -184,6 +191,7 @@ static void split_terminal_horizontal(GtkWidget *widget, gpointer data) {
     }
 }
 
+// Function to split the terminal vertically
 static void split_terminal_vertical(GtkWidget *widget, gpointer data) {
     GtkWidget *container = GTK_WIDGET(data);
 
@@ -210,6 +218,7 @@ static void split_terminal_vertical(GtkWidget *widget, gpointer data) {
     }
 }
 
+// Function to collapse a subterminal
 static void collapse_subterminal(GtkWidget *widget, gpointer data) {
     GtkWidget *container = GTK_WIDGET(data);
     if (GTK_IS_PANED(container)) {
@@ -223,6 +232,7 @@ static void collapse_subterminal(GtkWidget *widget, gpointer data) {
     }
 }
 
+// Function to handle terminal button press events
 static gboolean on_terminal_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
     if (event->type == GDK_BUTTON_PRESS && event->button == GDK_BUTTON_SECONDARY) {
         GtkWidget *terminal_box = GTK_WIDGET(data);
@@ -246,6 +256,7 @@ static gboolean on_terminal_button_press(GtkWidget *widget, GdkEventButton *even
     return FALSE;
 }
 
+// Function to create a tab label
 static GtkWidget* create_tab_label(GtkNotebook *notebook, const char *title) {
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
     GtkWidget *label = gtk_label_new(title);
@@ -258,6 +269,7 @@ static GtkWidget* create_tab_label(GtkNotebook *notebook, const char *title) {
     return hbox;
 }
 
+// Function to add a new terminal
 static void add_terminal(GtkNotebook *notebook) {
     GtkWidget *terminal_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     VteTerminal *terminal = VTE_TERMINAL(vte_terminal_new());
@@ -274,14 +286,17 @@ static void add_terminal(GtkNotebook *notebook) {
     gtk_widget_show_all(GTK_WIDGET(notebook));
 }
 
+// Function to handle automation actions
 static void automate_action(GtkWidget *widget, gpointer data) {
     g_print("Automation Option Selected: %s\n", (char *)data);
 }
 
+// Function to handle session actions
 static void session_action(GtkWidget *widget, gpointer data) {
     g_print("Session Option Selected: %s\n", (char *)data);
 }
 
+// Function to create a dropdown menu
 static GtkWidget* create_dropdown_menu(GtkWidget *button, const char *menu_items[], int num_items, GCallback callback) {
     if (!button || !menu_items || num_items <= 0) {
         g_critical("Invalid parameters passed to create_dropdown_menu");
@@ -299,6 +314,7 @@ static GtkWidget* create_dropdown_menu(GtkWidget *button, const char *menu_items
     return menu;
 }
 
+// Function to activate the application
 static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Scythe Terminal");
@@ -356,7 +372,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_container_add(GTK_CONTAINER(response_scrolled), response_view);
     gtk_box_pack_start(GTK_BOX(ai_panel), response_scrolled, FALSE, FALSE, 5);
 
-    // Create a struct to hold both widgets
+    // Create a struct to hold both widgets and pass it to the callback
     AiWidgets *widgets = g_new(AiWidgets, 1);
     widgets->entry = GTK_ENTRY(ai_entry);
     widgets->text_view = GTK_TEXT_VIEW(response_view);
@@ -367,6 +383,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_show_all(window);
 }
 
+// Main
 int main(int argc, char **argv) {
     GtkApplication *app = gtk_application_new("com.scythe.terminal", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);

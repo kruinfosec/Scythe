@@ -6,12 +6,28 @@
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
 #include <glib-object.h>
+#include <unistd.h>  // For access()
 
 // Define a struct to hold pointers to GtkEntry and GtkTextView widgets
 typedef struct {
     GtkEntry *entry;
     GtkTextView *text_view;
 } AiWidgets;
+
+// Define a struct for tracking terminal widgets
+typedef struct {
+    GtkWidget *box;        // Container box
+    GtkWidget *terminal;   // The VTE terminal
+    GtkWidget *parent;     // Parent container (paned or box)
+    gboolean is_split;     // Flag to indicate if this terminal is split
+} TerminalWidget;
+
+// Define a struct for passing data to menu item callbacks
+typedef struct {
+    gchar *action;
+    GtkWidget *notebook;
+    GtkWidget *window;
+} MenuItemData;
 
 // Forward declarations of functions
 static void spawn_shell(VteTerminal *terminal);
@@ -24,9 +40,14 @@ static void add_terminal(GtkNotebook *notebook);
 static GtkWidget* create_tab_label(GtkNotebook *notebook, const char *title);
 static void automate_action(GtkWidget *widget, gpointer data);
 static void session_action(GtkWidget *widget, gpointer data);
-static GtkWidget* create_dropdown_menu(GtkWidget *button, const char *menu_items[], int num_items, GCallback callback);
 static void send_ai_message(GtkWidget *widget, gpointer user_data);
 static gboolean update_text_view(gchar *message, GtkTextView *text_view);
+static VteTerminal* get_current_terminal(GtkNotebook *notebook);
+static void run_python_script(VteTerminal *terminal, const char *script_path);
+static void cleanup_ai_widgets(GtkWidget *widget, gpointer user_data);
+static TerminalWidget* create_terminal_widget(GtkWidget *parent);
+static void popup_menu_at_button(GtkWidget *button, GtkWidget *menu);
+static void free_menu_item_data(gpointer data);
 
 // Function to update the text view with a message
 static gboolean update_text_view(gchar *message, GtkTextView *text_view) {
@@ -44,6 +65,10 @@ static void ai_response_callback(SoupSession *session, SoupMessage *msg, gpointe
     }
 
     GtkTextView *text_view = GTK_TEXT_VIEW(user_data);
+    if (!GTK_IS_TEXT_VIEW(text_view)) {
+        g_critical("Invalid text view object.");
+        return;
+    }
 
     if (msg->status_code != SOUP_STATUS_OK) {
         gchar *message = g_strdup_printf("Error: HTTP %u - %s", msg->status_code, msg->reason_phrase);
@@ -94,6 +119,15 @@ static void send_ai_message(GtkWidget *widget, gpointer user_data) {
     }
 
     const gchar *input_text = gtk_entry_get_text(entry);
+    if (!input_text || strlen(input_text) == 0) {
+        GtkTextBuffer *buffer = gtk_text_view_get_buffer(text_view);
+        gtk_text_buffer_set_text(buffer, "Please enter a message first.", -1);
+        return;
+    }
+
+    // Let the user know that their message is being processed
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(text_view);
+    gtk_text_buffer_set_text(buffer, "Processing your request...", -1);
 
     JsonBuilder *builder = json_builder_new();
     json_builder_begin_object(builder);
@@ -112,22 +146,50 @@ static void send_ai_message(GtkWidget *widget, gpointer user_data) {
 
     if (!json_str) {
         g_print("Error: Failed to generate JSON string.\n");
-        goto cleanup;
+        gtk_text_buffer_set_text(buffer, "Error generating request.", -1);
+        json_node_free(root);
+        g_object_unref(gen);
+        g_object_unref(builder);
+        return;
     }
 
     SoupSession *session = soup_session_new();
     SoupMessage *msg = soup_message_new("POST", "http://127.0.0.1:11434/api/generate");
+    
+    if (!session || !msg) {
+        g_critical("Failed to create SoupSession or SoupMessage");
+        g_free(json_str);
+        gtk_text_buffer_set_text(buffer, "Error connecting to AI service.", -1);
+        if (session) g_object_unref(session);
+        if (msg) g_object_unref(msg);
+        json_node_free(root);
+        g_object_unref(gen);
+        g_object_unref(builder);
+        return;
+    }
+    
     soup_message_set_request(msg, "application/json", SOUP_MEMORY_COPY, json_str, strlen(json_str));
 
-    g_object_ref(session);
-    g_object_ref(msg);
+    // Clear the entry field after sending
+    gtk_entry_set_text(entry, "");
 
-    soup_session_queue_message(session, msg, ai_response_callback, (gpointer)text_view);
+    // Queue message and set up callback
+    g_object_ref(text_view); // Ensure text_view exists through callback
+    soup_session_queue_message(session, msg, ai_response_callback, text_view);
 
-cleanup:
+    // Cleanup
     g_free(json_str);
+    json_node_free(root);
     g_object_unref(gen);
     g_object_unref(builder);
+}
+
+// Function to cleanup AI widgets when window is destroyed
+static void cleanup_ai_widgets(GtkWidget *widget, gpointer user_data) {
+    AiWidgets *widgets = (AiWidgets *)user_data;
+    if (widgets) {
+        g_free(widgets);
+    }
 }
 
 // Function to spawn a shell in the terminal
@@ -164,87 +226,140 @@ static void close_tab(GtkWidget *widget, gpointer data) {
     }
 }
 
+// Create a terminal widget
+static TerminalWidget* create_terminal_widget(GtkWidget *parent) {
+    TerminalWidget *term_widget = g_new0(TerminalWidget, 1);
+    
+    term_widget->box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    term_widget->terminal = vte_terminal_new();
+    term_widget->parent = parent;
+    term_widget->is_split = FALSE;
+    
+    // Set up the terminal
+    spawn_shell(VTE_TERMINAL(term_widget->terminal));
+    gtk_widget_set_hexpand(term_widget->terminal, TRUE);
+    gtk_widget_set_vexpand(term_widget->terminal, TRUE);
+    
+    // Connect signals for right-click menu
+    g_signal_connect(term_widget->terminal, "button-press-event", 
+                     G_CALLBACK(on_terminal_button_press), term_widget);
+    
+    // Add terminal to box
+    gtk_box_pack_start(GTK_BOX(term_widget->box), term_widget->terminal, TRUE, TRUE, 0);
+    gtk_widget_show_all(term_widget->box);
+    
+    return term_widget;
+}
+
 // Function to split the terminal horizontally
 static void split_terminal_horizontal(GtkWidget *widget, gpointer data) {
-    GtkWidget *container = GTK_WIDGET(data);
-
-    if (!GTK_IS_PANED(container)) {
-        GList *children = gtk_container_get_children(GTK_CONTAINER(container));
-        if (!children) return;
-        GtkWidget *old_terminal = (GtkWidget *)g_list_nth_data(children, 0);
-        g_list_free(children);
-        gtk_container_remove(GTK_CONTAINER(container), old_terminal);
-
-        GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-        gtk_paned_pack1(GTK_PANED(paned), old_terminal, TRUE, TRUE);
-
-        VteTerminal *new_terminal = VTE_TERMINAL(vte_terminal_new());
-        spawn_shell(new_terminal);
-        gtk_widget_set_hexpand(GTK_WIDGET(new_terminal), TRUE);
-        gtk_widget_set_vexpand(GTK_WIDGET(new_terminal), TRUE);
-        gtk_paned_pack2(GTK_PANED(paned), GTK_WIDGET(new_terminal), TRUE, TRUE);
-
-        gtk_box_pack_start(GTK_BOX(container), paned, TRUE, TRUE, 0);
-        gtk_widget_show_all(container);
-    } else {
-        g_print("Already split horizontally.\n");
-    }
+    TerminalWidget *term_widget = (TerminalWidget *)data;
+    GtkWidget *parent = gtk_widget_get_parent(term_widget->box);
+    
+    // Remove the terminal box from its parent
+    g_object_ref(term_widget->box); // Increase reference count so it's not destroyed
+    gtk_container_remove(GTK_CONTAINER(parent), term_widget->box);
+    
+    // Create a new paned container
+    GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_set_position(GTK_PANED(paned), 400); // Default split position
+    
+    // Add the existing terminal to the left pane
+    gtk_paned_pack1(GTK_PANED(paned), term_widget->box, TRUE, TRUE);
+    g_object_unref(term_widget->box); // Release our reference
+    
+    // Create a new terminal for the right pane
+    TerminalWidget *new_term = create_terminal_widget(paned);
+    gtk_paned_pack2(GTK_PANED(paned), new_term->box, TRUE, TRUE);
+    
+    // Update the original terminal's parent reference
+    term_widget->parent = paned;
+    term_widget->is_split = TRUE;
+    
+    // Add the paned widget to the parent container
+    gtk_container_add(GTK_CONTAINER(parent), paned);
+    gtk_widget_show_all(parent);
 }
 
 // Function to split the terminal vertically
 static void split_terminal_vertical(GtkWidget *widget, gpointer data) {
-    GtkWidget *container = GTK_WIDGET(data);
-
-    if (!GTK_IS_PANED(container)) {
-        GList *children = gtk_container_get_children(GTK_CONTAINER(container));
-        if (!children) return;
-        GtkWidget *old_terminal = (GtkWidget *)g_list_nth_data(children, 0);
-        g_list_free(children);
-        gtk_container_remove(GTK_CONTAINER(container), old_terminal);
-
-        GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
-        gtk_paned_pack1(GTK_PANED(paned), old_terminal, TRUE, TRUE);
-
-        VteTerminal *new_terminal = VTE_TERMINAL(vte_terminal_new());
-        spawn_shell(new_terminal);
-        gtk_widget_set_hexpand(GTK_WIDGET(new_terminal), TRUE);
-        gtk_widget_set_vexpand(GTK_WIDGET(new_terminal), TRUE);
-        gtk_paned_pack2(GTK_PANED(paned), GTK_WIDGET(new_terminal), TRUE, TRUE);
-
-        gtk_box_pack_start(GTK_BOX(container), paned, TRUE, TRUE, 0);
-        gtk_widget_show_all(container);
-    } else {
-        g_print("Already split vertically.\n");
-    }
+    TerminalWidget *term_widget = (TerminalWidget *)data;
+    GtkWidget *parent = gtk_widget_get_parent(term_widget->box);
+    
+    // Remove the terminal box from its parent
+    g_object_ref(term_widget->box); // Increase reference count so it's not destroyed
+    gtk_container_remove(GTK_CONTAINER(parent), term_widget->box);
+    
+    // Create a new paned container
+    GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_paned_set_position(GTK_PANED(paned), 300); // Default split position
+    
+    // Add the existing terminal to the top pane
+    gtk_paned_pack1(GTK_PANED(paned), term_widget->box, TRUE, TRUE);
+    g_object_unref(term_widget->box); // Release our reference
+    
+    // Create a new terminal for the bottom pane
+    TerminalWidget *new_term = create_terminal_widget(paned);
+    gtk_paned_pack2(GTK_PANED(paned), new_term->box, TRUE, TRUE);
+    
+    // Update the original terminal's parent reference
+    term_widget->parent = paned;
+    term_widget->is_split = TRUE;
+    
+    // Add the paned widget to the parent container
+    gtk_container_add(GTK_CONTAINER(parent), paned);
+    gtk_widget_show_all(parent);
 }
 
 // Function to collapse a subterminal
 static void collapse_subterminal(GtkWidget *widget, gpointer data) {
-    GtkWidget *container = GTK_WIDGET(data);
-    if (GTK_IS_PANED(container)) {
-        GtkWidget *child1 = gtk_paned_get_child1(GTK_PANED(container));
-        GtkWidget *parent = gtk_widget_get_parent(container);
-        gtk_container_remove(GTK_CONTAINER(parent), container);
-        gtk_container_add(GTK_CONTAINER(parent), child1);
-        gtk_widget_show_all(parent);
-    } else {
-        g_print("No subterminal to collapse.\n");
+    TerminalWidget *term_widget = (TerminalWidget *)data;
+    GtkWidget *paned = gtk_widget_get_parent(term_widget->box);
+    
+    // Only proceed if the parent is actually a paned widget
+    if (!GTK_IS_PANED(paned)) {
+        g_print("This terminal is not in a split view.\n");
+        return;
     }
+    
+    // Get the paned's parent
+    GtkWidget *grandparent = gtk_widget_get_parent(paned);
+    if (!grandparent) {
+        g_print("Cannot collapse: no grandparent container found.\n");
+        return;
+    }
+    
+    // Remove our terminal from the paned
+    g_object_ref(term_widget->box); // Increase reference count
+    gtk_container_remove(GTK_CONTAINER(paned), term_widget->box);
+    
+    // Remove the paned from its parent
+    gtk_container_remove(GTK_CONTAINER(grandparent), paned);
+    
+    // Add our terminal directly to the grandparent
+    gtk_container_add(GTK_CONTAINER(grandparent), term_widget->box);
+    g_object_unref(term_widget->box); // Release our reference
+    
+    // Update terminal widget state
+    term_widget->parent = grandparent;
+    term_widget->is_split = FALSE;
+    
+    gtk_widget_show_all(grandparent);
 }
 
 // Function to handle terminal button press events
 static gboolean on_terminal_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
     if (event->type == GDK_BUTTON_PRESS && event->button == GDK_BUTTON_SECONDARY) {
-        GtkWidget *terminal_box = GTK_WIDGET(data);
+        TerminalWidget *term_widget = (TerminalWidget *)data;
         GtkWidget *menu = gtk_menu_new();
 
         GtkWidget *split_horizontally = gtk_menu_item_new_with_label("Split Horizontally");
         GtkWidget *split_vertically = gtk_menu_item_new_with_label("Split Vertically");
         GtkWidget *collapse_item = gtk_menu_item_new_with_label("Collapse Subterminal");
 
-        g_signal_connect(split_horizontally, "activate", G_CALLBACK(split_terminal_horizontal), terminal_box);
-        g_signal_connect(split_vertically, "activate", G_CALLBACK(split_terminal_vertical), terminal_box);
-        g_signal_connect(collapse_item, "activate", G_CALLBACK(collapse_subterminal), terminal_box);
+        g_signal_connect(split_horizontally, "activate", G_CALLBACK(split_terminal_horizontal), term_widget);
+        g_signal_connect(split_vertically, "activate", G_CALLBACK(split_terminal_vertical), term_widget);
+        g_signal_connect(collapse_item, "activate", G_CALLBACK(collapse_subterminal), term_widget);
 
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), split_horizontally);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), split_vertically);
@@ -271,46 +386,264 @@ static GtkWidget* create_tab_label(GtkNotebook *notebook, const char *title) {
 
 // Function to add a new terminal
 static void add_terminal(GtkNotebook *notebook) {
-    GtkWidget *terminal_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    VteTerminal *terminal = VTE_TERMINAL(vte_terminal_new());
-    spawn_shell(terminal);
-    gtk_widget_set_hexpand(GTK_WIDGET(terminal), TRUE);
-    gtk_widget_set_vexpand(GTK_WIDGET(terminal), TRUE);
-    g_signal_connect(GTK_WIDGET(terminal), "button-press-event", G_CALLBACK(on_terminal_button_press), terminal_box);
-    gtk_box_pack_start(GTK_BOX(terminal_box), GTK_WIDGET(terminal), TRUE, TRUE, 0);
+    GtkWidget *tab_container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    TerminalWidget *term_widget = create_terminal_widget(tab_container);
+    
+    gtk_container_add(GTK_CONTAINER(tab_container), term_widget->box);
 
     int current_page = gtk_notebook_get_current_page(notebook);
     int new_page = (current_page >= 0) ? current_page + 1 : 0;
-    gtk_notebook_insert_page(notebook, terminal_box, create_tab_label(notebook, "Terminal"), new_page);
+    gtk_notebook_insert_page(notebook, tab_container, create_tab_label(notebook, "Terminal"), new_page);
     gtk_notebook_set_current_page(notebook, new_page);
     gtk_widget_show_all(GTK_WIDGET(notebook));
 }
 
-// Function to handle automation actions
+static VteTerminal* get_current_terminal(GtkNotebook *notebook) {
+    int current_page = gtk_notebook_get_current_page(notebook);
+    if (current_page == -1) {
+        g_critical("No current page in notebook");
+        return NULL;
+    }
+    
+    GtkWidget *tab_container = gtk_notebook_get_nth_page(notebook, current_page);
+    if (!tab_container) {
+        g_critical("Could not get terminal container from notebook page");
+        return NULL;
+    }
+    
+    // Find the VTE terminal in the container hierarchy
+    GList *children = gtk_container_get_children(GTK_CONTAINER(tab_container));
+    if (!children) {
+        g_critical("No children found in tab container");
+        return NULL;
+    }
+    
+    // The first child should be our box containing the terminal
+    GtkWidget *term_box = (GtkWidget *)g_list_nth_data(children, 0);
+    g_list_free(children);
+    
+    if (!term_box) {
+        g_critical("No terminal box found");
+        return NULL;
+    }
+    
+    children = gtk_container_get_children(GTK_CONTAINER(term_box));
+    if (!children) {
+        g_critical("No children found in terminal box");
+        return NULL;
+    }
+    
+    // The first child should be the terminal or a paned widget
+    GtkWidget *widget = (GtkWidget *)g_list_nth_data(children, 0);
+    g_list_free(children);
+    
+    if (VTE_IS_TERMINAL(widget)) {
+        return VTE_TERMINAL(widget);
+    } else if (GTK_IS_PANED(widget)) {
+        // If it's a paned widget, recursively search for the first terminal
+        GtkWidget *child1 = gtk_paned_get_child1(GTK_PANED(widget));
+        children = gtk_container_get_children(GTK_CONTAINER(child1));
+        if (children) {
+            widget = (GtkWidget *)g_list_nth_data(children, 0);
+            g_list_free(children);
+            if (VTE_IS_TERMINAL(widget)) {
+                return VTE_TERMINAL(widget);
+            }
+        }
+    }
+    
+    g_critical("Could not find VTE terminal widget");
+    return NULL;
+}
+
+static void run_python_script(VteTerminal *terminal, const char *script_path) {
+    if (!terminal || !script_path) {
+        g_critical("Invalid terminal or script path");
+        return;
+    }
+
+    // Check if file exists
+    if (access(script_path, F_OK) == -1) {
+        g_critical("Python script does not exist: %s", script_path);
+        return;
+    }
+
+    g_print("Running Python script: %s\n", script_path);
+    
+    // Create arguments for the Python script
+    char *argv[] = { "python3", (char *)script_path, NULL };
+
+    // Spawn the process in the terminal
+    vte_terminal_spawn_async(
+        terminal,
+        VTE_PTY_DEFAULT,
+        NULL,
+        argv,
+        NULL,
+        0,
+        NULL,
+        NULL,
+        NULL,
+        -1,
+        NULL,
+        NULL,
+        NULL
+    );
+}
+
 static void automate_action(GtkWidget *widget, gpointer data) {
-    g_print("Automation Option Selected: %s\n", (char *)data);
+    MenuItemData *item_data = (MenuItemData *)data;
+    if (!item_data) {
+        g_critical("Null data received in automate_action");
+        return;
+    }
+    
+    const gchar *action = item_data->action;
+    GtkWidget *notebook = item_data->notebook;
+    
+    g_print("Automation action: %s\n", action);
+    
+    if (g_strcmp0(action, "EXTSEC") == 0) {
+        if (!notebook || !GTK_IS_NOTEBOOK(notebook)) {
+            g_critical("Invalid notebook widget");
+            return;
+        }
+        
+        // Get current terminal directly using the notebook
+        VteTerminal *terminal = get_current_terminal(GTK_NOTEBOOK(notebook));
+        if (!terminal) {
+            g_critical("Could not get current terminal");
+            return;
+        }
+        
+        // Run the server.py script
+        const char *script_path = "./server.py";
+        if (access(script_path, F_OK) == -1) {
+            g_critical("Script not found: %s", script_path);
+            return;
+        }
+        
+        g_print("Running script: %s\n", script_path);
+        run_python_script(terminal, script_path);
+    }
 }
 
 // Function to handle session actions
 static void session_action(GtkWidget *widget, gpointer data) {
-    g_print("Session Option Selected: %s\n", (char *)data);
+    const gchar *action = (const gchar *)data;
+    
+    if (!action) {
+        g_critical("Null action received in session_action");
+        return;
+    }
+    
+    g_print("Session action: %s\n", action);
+    
+    // These are placeholders - in a real implementation, they would perform the actual actions
+    if (g_strcmp0(action, "Save Session") == 0) {
+        g_print("Save session functionality would be implemented here\n");
+    } else if (g_strcmp0(action, "Load Session") == 0) {
+        g_print("Load session functionality would be implemented here\n");
+    } else if (g_strcmp0(action, "Close All") == 0) {
+        GtkWidget *toplevel = gtk_widget_get_toplevel(widget);
+        if (!GTK_IS_WINDOW(toplevel)) {
+            return;
+        }
+        
+        // Find the notebook widget more systematically
+        GtkWidget *notebook = NULL;
+        GList *all_widgets = gtk_container_get_children(GTK_CONTAINER(toplevel));
+        for (GList *l = all_widgets; l != NULL; l = l->next) {
+            if (GTK_IS_BOX(l->data)) {
+                GList *box_children = gtk_container_get_children(GTK_CONTAINER(l->data));
+                for (GList *cl = box_children; cl != NULL; cl = cl->next) {
+                    if (GTK_IS_BOX(cl->data)) {
+                        GList *inner_children = gtk_container_get_children(GTK_CONTAINER(cl->data));
+                        for (GList *ic = inner_children; ic != NULL; ic = ic->next) {
+                            if (GTK_IS_NOTEBOOK(ic->data)) {
+                                notebook = GTK_WIDGET(ic->data);
+                                break;
+                            }
+                        }
+                        g_list_free(inner_children);
+                        if (notebook) break;
+                    } else if (GTK_IS_NOTEBOOK(cl->data)) {
+                        notebook = GTK_WIDGET(cl->data);
+                        break;
+                    }
+                }
+                g_list_free(box_children);
+                if (notebook) break;
+            }
+        }
+        g_list_free(all_widgets);
+        
+        if (notebook) {
+            while (gtk_notebook_get_n_pages(GTK_NOTEBOOK(notebook)) > 0) {
+                gtk_notebook_remove_page(GTK_NOTEBOOK(notebook), 0);
+            }
+            // Add a new terminal after closing all
+            add_terminal(GTK_NOTEBOOK(notebook));
+        } else {
+            g_critical("Could not find notebook widget");
+        }
+    }
+}
+
+static void free_menu_item_data(gpointer data) {
+    if (data) {
+        MenuItemData *item_data = (MenuItemData *)data;
+        g_free(item_data->action);
+        g_free(item_data);
+    }
+}
+
+// Helper function to show menu at button
+static void popup_menu_at_button(GtkWidget *button, GtkWidget *menu) {
+    gtk_menu_popup_at_widget(GTK_MENU(menu), button, GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST, NULL);
 }
 
 // Function to create a dropdown menu
 static GtkWidget* create_dropdown_menu(GtkWidget *button, const char *menu_items[], int num_items, GCallback callback) {
-    if (!button || !menu_items || num_items <= 0) {
-        g_critical("Invalid parameters passed to create_dropdown_menu");
-        return NULL;
-    }
-
     GtkWidget *menu = gtk_menu_new();
+
+    // Get the references from the button
+    GtkWidget *notebook = g_object_get_data(G_OBJECT(button), "notebook");
+    GtkWidget *window = g_object_get_data(G_OBJECT(button), "window");
+
     for (int i = 0; i < num_items; i++) {
         GtkWidget *item = gtk_menu_item_new_with_label(menu_items[i]);
-        g_signal_connect(item, "activate", callback, g_strdup(menu_items[i]));
+        
+        // Create the data structure to pass multiple pieces of data
+        typedef struct {
+            gchar *action;
+            GtkWidget *notebook;
+            GtkWidget *window;
+        } MenuItemData;
+        
+        MenuItemData *item_data = g_new(MenuItemData, 1);
+        item_data->action = g_strdup(menu_items[i]);
+        item_data->notebook = notebook;
+        item_data->window = window;
+        
+        // Connect signal with this data
+        g_signal_connect(item, "activate", callback, item_data);
+        
+        // Set up cleanup when the item is destroyed
+        g_object_set_data_full(G_OBJECT(item), "item-data", item_data, 
+            (GDestroyNotify)free_menu_item_data);
+        
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-    }
+    };
+    
     gtk_widget_show_all(menu);
-    g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_menu_popup_at_widget), menu);
+    
+    // Store the menu as data on the button so it doesn't get garbage collected
+    g_object_set_data_full(G_OBJECT(button), "dropdown-menu", menu, NULL);
+    
+    // Connect the button to the menu
+    g_signal_connect(button, "clicked", G_CALLBACK(popup_menu_at_button), menu);
+    
     return menu;
 }
 
@@ -327,29 +660,33 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
     gtk_window_set_titlebar(GTK_WINDOW(window), header);
 
+    GtkWidget *notebook = gtk_notebook_new();
+    
     GtkWidget *new_terminal_btn = gtk_button_new_with_label("New Terminal");
-    g_signal_connect(new_terminal_btn, "clicked", G_CALLBACK(add_terminal), NULL);
+    g_signal_connect_swapped(new_terminal_btn, "clicked", G_CALLBACK(add_terminal), notebook);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(header), new_terminal_btn);
-
-    const char *automate_items[] = {"Auto Recon", "Scan Network", "Exploit Search"};
-    GtkWidget *automate_btn = gtk_menu_button_new();
-    gtk_button_set_label(GTK_BUTTON(automate_btn), "Automate");
-    create_dropdown_menu(automate_btn, automate_items, 3, G_CALLBACK(automate_action));
+    
+    // Create the Automate button with its dropdown menu
+    GtkWidget *automate_btn = gtk_button_new_with_label("Automate");
+    g_object_set_data(G_OBJECT(automate_btn), "notebook", notebook);
+    g_object_set_data(G_OBJECT(automate_btn), "window", window);
+    const char *automate_items[] = {"EXTSEC"};
+    create_dropdown_menu(automate_btn, automate_items, 1, G_CALLBACK(automate_action));
     gtk_header_bar_pack_start(GTK_HEADER_BAR(header), automate_btn);
 
+    // Create the Session button with its dropdown menu
+    GtkWidget *session_btn = gtk_button_new_with_label("Session");
     const char *session_items[] = {"Save Session", "Load Session", "Close All"};
-    GtkWidget *session_btn = gtk_menu_button_new();
-    gtk_button_set_label(GTK_BUTTON(session_btn), "Session");
     create_dropdown_menu(session_btn, session_items, 3, G_CALLBACK(session_action));
     gtk_header_bar_pack_start(GTK_HEADER_BAR(header), session_btn);
 
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_box_pack_start(GTK_BOX(vbox), hbox, TRUE, TRUE, 0);
 
-    GtkWidget *notebook = gtk_notebook_new();
     gtk_box_pack_start(GTK_BOX(hbox), notebook, TRUE, TRUE, 0);
     add_terminal(GTK_NOTEBOOK(notebook));
 
+    // Set up the AI Assistant panel
     GtkWidget *ai_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_widget_set_size_request(ai_panel, 500, -1);
     GtkWidget *ai_label = gtk_label_new("AI Assistant");
@@ -370,20 +707,27 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(response_scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_size_request(response_scrolled, -1, 700);
     gtk_container_add(GTK_CONTAINER(response_scrolled), response_view);
-    gtk_box_pack_start(GTK_BOX(ai_panel), response_scrolled, FALSE, FALSE, 5);
+    gtk_box_pack_start(GTK_BOX(ai_panel), response_scrolled, TRUE, TRUE, 5);
 
     // Create a struct to hold both widgets and pass it to the callback
     AiWidgets *widgets = g_new(AiWidgets, 1);
+    if (!widgets) {
+        g_critical("Failed to allocate memory for AI widgets");
+        return;
+    }
     widgets->entry = GTK_ENTRY(ai_entry);
     widgets->text_view = GTK_TEXT_VIEW(response_view);
 
     g_signal_connect(send_button, "clicked", G_CALLBACK(send_ai_message), widgets);
+    g_signal_connect(ai_entry, "activate", G_CALLBACK(send_ai_message), widgets);
+    g_signal_connect(window, "destroy", G_CALLBACK(cleanup_ai_widgets), widgets);
 
     gtk_box_pack_start(GTK_BOX(hbox), ai_panel, FALSE, FALSE, 0);
+    gtk_widget_show_all(GTK_WIDGET(header));
     gtk_widget_show_all(window);
 }
 
-// Main
+// Main function
 int main(int argc, char **argv) {
     GtkApplication *app = gtk_application_new("com.scythe.terminal", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);

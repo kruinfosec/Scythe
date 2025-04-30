@@ -526,6 +526,29 @@ static void automate_action(GtkWidget *widget, gpointer data) {
         g_print("Running script: %s\n", script_path);
         run_python_script(terminal, script_path);
     }
+    else if (g_strcmp0(action, "CVE-Lookup") == 0) {
+        if (!notebook || !GTK_IS_NOTEBOOK(notebook)) {
+            g_critical("Invalid notebook widget");
+            return;
+        }
+        
+        // Get current terminal directly using the notebook
+        VteTerminal *terminal = get_current_terminal(GTK_NOTEBOOK(notebook));
+        if (!terminal) {
+            g_critical("Could not get current terminal");
+            return;
+        }
+        
+        // Run the CVE-Lookup.py script
+        const char *script_path = "./CVE-Lookup.py";
+        if (access(script_path, F_OK) == -1) {
+            g_critical("Script not found: %s", script_path);
+            return;
+        }
+        
+        g_print("Running script: %s\n", script_path);
+        run_python_script(terminal, script_path);
+    }
 }
 
 // Function to handle session actions
@@ -603,24 +626,27 @@ static void popup_menu_at_button(GtkWidget *button, GtkWidget *menu) {
     gtk_menu_popup_at_widget(GTK_MENU(menu), button, GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST, NULL);
 }
 
-// Function to create a dropdown menu
+// Function to create a dropdown menu - updated version
 static GtkWidget* create_dropdown_menu(GtkWidget *button, const char *menu_items[], int num_items, GCallback callback) {
+    // First, remove any existing menu
+    GtkWidget *old_menu = g_object_get_data(G_OBJECT(button), "dropdown-menu");
+    if (old_menu) {
+        gtk_widget_destroy(old_menu);
+        g_object_set_data(G_OBJECT(button), "dropdown-menu", NULL);
+    }
+    
+    // Create a new menu
     GtkWidget *menu = gtk_menu_new();
 
     // Get the references from the button
     GtkWidget *notebook = g_object_get_data(G_OBJECT(button), "notebook");
     GtkWidget *window = g_object_get_data(G_OBJECT(button), "window");
 
+    // Add menu items
     for (int i = 0; i < num_items; i++) {
         GtkWidget *item = gtk_menu_item_new_with_label(menu_items[i]);
         
         // Create the data structure to pass multiple pieces of data
-        typedef struct {
-            gchar *action;
-            GtkWidget *notebook;
-            GtkWidget *window;
-        } MenuItemData;
-        
         MenuItemData *item_data = g_new(MenuItemData, 1);
         item_data->action = g_strdup(menu_items[i]);
         item_data->notebook = notebook;
@@ -634,14 +660,18 @@ static GtkWidget* create_dropdown_menu(GtkWidget *button, const char *menu_items
             (GDestroyNotify)free_menu_item_data);
         
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+        
+        // Debug print to confirm item was added
+        g_print("Added menu item: %s\n", menu_items[i]);
     };
     
     gtk_widget_show_all(menu);
     
-    // Store the menu as data on the button so it doesn't get garbage collected
-    g_object_set_data_full(G_OBJECT(button), "dropdown-menu", menu, NULL);
+    // Store the menu as data on the button
+    g_object_set_data_full(G_OBJECT(button), "dropdown-menu", menu, (GDestroyNotify)gtk_widget_destroy);
     
-    // Connect the button to the menu
+    // Disconnect any previous handlers and connect the button to the menu
+    g_signal_handlers_disconnect_by_func(button, G_CALLBACK(popup_menu_at_button), old_menu);
     g_signal_connect(button, "clicked", G_CALLBACK(popup_menu_at_button), menu);
     
     return menu;
@@ -670,8 +700,8 @@ static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *automate_btn = gtk_button_new_with_label("Automate");
     g_object_set_data(G_OBJECT(automate_btn), "notebook", notebook);
     g_object_set_data(G_OBJECT(automate_btn), "window", window);
-    const char *automate_items[] = {"EXTSEC"};
-    create_dropdown_menu(automate_btn, automate_items, 1, G_CALLBACK(automate_action));
+    const char *automate_items[] = {"EXTSEC", "CVE-Lookup"};
+    create_dropdown_menu(automate_btn, automate_items, 2, G_CALLBACK(automate_action));
     gtk_header_bar_pack_start(GTK_HEADER_BAR(header), automate_btn);
 
     // Create the Session button with its dropdown menu

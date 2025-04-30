@@ -18,38 +18,16 @@ Database:
 • psycopg2-binary (PostgreSQL adapter for Python)
 
 AI Integration:
-• DeepSeek (local instance or API setup)
-• Requests (for HTTP communication with the DeepSeek API)
+• Llama3 (local instance or API setup)
+• Requests (for HTTP communication with the Llama3 API)
 
 Vulnerability Scanning Tools:
 • Nmap
-• OpenVAS
-• OWASP ZAP
+• Nikto
 (Ensure these tools are installed on your system or available via Docker)
 
 Reporting & Documentation:
 • ReportLab (for generating PDF reports)
-
-# Structure
-
-/project-root
-├── README.md                # Project overview & usage instructions
-├── package.json             # Node.js/Electron configuration
-├── main.js                  # Electron main process
-├── index.html               # Main HTML file for the Electron app
-├── renderer.js              # Frontend JavaScript (xterm.js integration)
-├── /src
-│   ├── /database            # PostgreSQL integration code
-│   │     └── db_setup.py    # SQLAlchemy schema & connection
-│   ├── /reports             # Report generation module
-│   │     └── report_generator.py  # ReportLab-based PDF generator
-│   ├── /ai                  # AI integration module
-│   │     └── ai_module.py   # DeepSeek API integration using requests
-│   ├── /scanners            # Vulnerability scanning integration
-│   │     └── scanners.js    # (Sample) Node child_process calls to Nmap/OpenVAS/ZAP
-│   └── /collaboration       # (Future) Collaboration features
-├── /tests                   # Unit and integration tests
-└── /docs                    # Design documents and additional documentation
 
 # Minimum Specs (runs all features, but slower AI inference):
  - CPU: 4-core (e.g., Intel i5-8250U / Ryzen 5 2500U)
@@ -63,6 +41,3 @@ Reporting & Documentation:
  - GPU: 6–8 GB VRAM (e.g., RTX 3060, RX 6600)
  - Disk: 20+ GB free
  - OS: Latest Linux (Ubuntu 22.04+ / Arch / Fedora)
-
-# To set OpenAI API key as an environment variable:
- - export OPENAI_API_KEY="your-api-key"

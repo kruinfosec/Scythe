@@ -1,5 +1,6 @@
 #include <gtk/gtk.h>
 #include <vte/vte.h>
+#include <gdk/gdkkeysyms.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -45,6 +46,10 @@ static gboolean update_text_view(gchar *message, GtkTextView *text_view);
 static VteTerminal* get_current_terminal(GtkNotebook *notebook);
 static void run_python_script(VteTerminal *terminal, const char *script_path);
 static void cleanup_ai_widgets(GtkWidget *widget, gpointer user_data);
+static gboolean on_key_press(GtkWidget *widget,GdkEventKey *event, gpointer user_data);
+static gboolean on_button_press(GtkWidget *widget,GdkEventButton *event, gpointer user_data);
+static void on_copy_activate(GtkMenuItem *item, gpointer user_data);
+static void on_paste_activate(GtkMenuItem *item, gpointer user_data);
 static TerminalWidget* create_terminal_widget(GtkWidget *parent);
 static void popup_menu_at_button(GtkWidget *button, GtkWidget *menu);
 static void free_menu_item_data(gpointer data);
@@ -243,7 +248,12 @@ static TerminalWidget* create_terminal_widget(GtkWidget *parent) {
     // Connect signals for right-click menu
     g_signal_connect(term_widget->terminal, "button-press-event", 
                      G_CALLBACK(on_terminal_button_press), term_widget);
-    
+
+    // ⇨ Connect Ctrl+Shift+C/V handlers for copy & paste
+    g_signal_connect(term_widget->terminal, "key-press-event",
+                     G_CALLBACK(on_key_press),
+                     term_widget->terminal);
+
     // Add terminal to box
     gtk_box_pack_start(GTK_BOX(term_widget->box), term_widget->terminal, TRUE, TRUE, 0);
     gtk_widget_show_all(term_widget->box);
@@ -757,7 +767,54 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_show_all(window);
 }
 
+// Handle Ctrl+Shift+C and Ctrl+Shift+V
+gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
+    VteTerminal *terminal = VTE_TERMINAL(user_data);
+
+    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK)) {
+        switch (event->keyval) {
+            case GDK_KEY_C:
+                vte_terminal_copy_clipboard_format(terminal, VTE_FORMAT_TEXT);
+                return TRUE;
+            case GDK_KEY_V:
+                vte_terminal_paste_clipboard(terminal);
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// Right-click context menu
+void on_copy_activate(GtkMenuItem *item, gpointer user_data) {
+    vte_terminal_copy_clipboard_format(VTE_TERMINAL(user_data), VTE_FORMAT_TEXT);
+}
+
+void on_paste_activate(GtkMenuItem *item, gpointer user_data) {
+    vte_terminal_paste_clipboard(VTE_TERMINAL(user_data));
+}
+
+gboolean on_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {
+        GtkWidget *menu = gtk_menu_new();
+        GtkWidget *copy_item = gtk_menu_item_new_with_label("Copy");
+        GtkWidget *paste_item = gtk_menu_item_new_with_label("Paste");
+
+        g_signal_connect(copy_item, "activate", G_CALLBACK(on_copy_activate), user_data);
+        g_signal_connect(paste_item, "activate", G_CALLBACK(on_paste_activate), user_data);
+
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), copy_item);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), paste_item);
+
+        gtk_widget_show_all(menu);
+        gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent*)event);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+
 // Main function
+
 int main(int argc, char **argv) {
     GtkApplication *app = gtk_application_new("com.scythe.terminal", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);

@@ -36,8 +36,11 @@ Reporting & Documentation:
  - Disk: 10 GB free (for tools, AI models, session logs)
  - OS: 64-bit Linux with GTK+ 3, VTE, Python 3.8+, bash
 # Recommended Specs (for smooth multiterminal use + fast AI):
- - CPU: 6-core or better (e.g., i5-11400H / Ryzen 5 5600)
+ -CPU: 6-core or better (e.g., i5-11400H / Ryzen 5 5600)
  - RAM: 16 GB
  - GPU: 6–8 GB VRAM (e.g., RTX 3060, RX 6600)
  - Disk: 20+ GB free
  - OS: Latest Linux (Ubuntu 22.04+ / Arch / Fedora)
+
+# To Compile the code
+ - gcc -o scythe embedded_terminal.c `pkg-config --cflags --libs gtk+-3.0 vte-2.91 json-glib-1.0 libsoup-2.4` -Wall

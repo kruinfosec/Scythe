@@ -1,0 +1,44 @@
+how the AI functionality works in the code you are
+  actually compiling and running, followed by a statement of the problem.
+
+  How the AI Works in Your Tool
+
+  The AI integration is handled entirely by the C program embedded_terminal.c, which compiles into the scythe executable. The workflow is as follows:
+
+  1. The User Interface (GTK+):
+   * The application builds its user interface using the GTK+3 toolkit, a popular framework for creating graphical applications in C.
+   * The "AI Assistant" panel, including the input box (GtkEntry) and the response area (GtkTextView), are all GTK+ widgets.
+
+  2. Sending the Prompt:
+   * When you type a message and click "Send," the send_ai_message function is called.
+   * It constructs a JSON object containing the prompt and the instruction to stream the response ("stream": true).
+   * It uses the libsoup library, a networking library for GTK applications, to send this JSON as an HTTP POST request to the local Ollama server at
+     http://127.0.0.1:11434/api/generate.
+   * The request is asynchronous. The application registers a function, ai_response_callback, to handle the data once the server starts responding.
+
+  3. Receiving and Processing the Stream:
+   * The Ollama server, running the llama3 model, receives the request and starts generating a response.
+   * Because of "stream": true, it sends the response back piece by piece. The full response arrives as a single body of text containing many small,
+     newline-separated JSON objects.
+   * When the stream is complete, libsoup invokes your ai_response_callback function.
+   * This function takes the raw text body of the response, splits it into individual lines, and processes each line one by one.
+   * For each line, it uses the json-glib library to parse the string as a JSON object and extracts the value of the "response" key (a small piece of
+     the AI's answer).
+   * It appends each of these pieces into a single, complete string.
+   * Finally, it updates the GtkTextView widget once with the fully assembled answer.
+
+  It is also important to note a major discrepancy: your README.md file describes a completely different application built with Python and the
+  PyQt5/QTermWidget libraries. However, the code you are compiling and running is the C and GTK+3 application from embedded_terminal.c. The setup
+  script Dependencies.sh also only installs libraries for the C/GTK application.
+
+  ---
+
+  Statement of the Problem
+
+  The bus error is not caused by a logical flaw in your C application code. The fixes applied have already made the code robust against the most
+  common memory management errors.
+
+  The problem lies in a lower-level, latent bug within one of the C libraries being used—most likely json-glib or libsoup. The specific data stream
+  being sent back by the llama3 model from Ollama, even when handled correctly by your application code, is triggering a fatal memory-handling error
+  (a bus error, likely from a misaligned memory access) deep inside one of these underlying libraries as it parses the raw HTTP response. Your
+  application code is correct, but the library it is calling cannot handle the specific data it is being fed.

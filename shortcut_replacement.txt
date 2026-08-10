@@ -1,0 +1,8 @@
+                  for (GList *l = children; l != NULL; l = l->next) {
+                      if (GTK_IS_PANED(l->data)) {
+                          // Call the common toggle function (same as button)
+                          extern void toggle_ai_panel_common(GtkPaned *hpaned);
+                          toggle_ai_panel_common(GTK_PANED(l->data));
+                          break; // Found it
+                      }
+                  }

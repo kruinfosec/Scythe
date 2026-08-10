@@ -1,0 +1,939 @@
+#include "webview_ai.h"
+#include "conversation.h"
+#include "common.h"  // For AppSettings
+#include <string.h>
+
+// HTML template with dark theme CSS and syntax highlighting
+static const char *HTML_TEMPLATE = 
+"<!DOCTYPE html>\n"
+"<html>\n"
+"<head>\n"
+"<meta charset='UTF-8'>\n"
+"<style>\n"
+"    :root {\n"
+"        /* Base Variables (Overridden by JS) */\n"
+"        --bg-color: #292c37;\n" // Default to transparent so GTK bg shows through
+"        --text-color: #ffffff;\n"
+"        --code-bg: #1e1e1e;\n"
+"        \n"
+"        /* Modern UI Pallete */\n"
+"        --font-stack: 'Segoe UI', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;\n"
+"        --mono-font: 'JetBrains Mono', 'Fira Code', monospace;\n"
+"        --border-radius: 6px;\n"
+"        \n"
+"        --msg-user-bg: rgba(59, 130, 246, 0.12); /* Light blue tint */\n"
+"        --msg-user-text: var(--text-color);      /* Default to main text color */\n"
+"        --msg-user-border: #3b82f6; /* Blue Accent */\n"
+"        --msg-ai-bg: rgba(16, 185, 129, 0.12); /* Light green tint */\n"
+"        --msg-ai-text: var(--text-color);      /* Default to main text color */\n"
+"        --msg-ai-border: #10b981;   /* Green Accent */\n"
+"        \n"
+"        /* Tables */\n"
+"        --table-border: #444;\n"
+"        --th-bg: rgba(128, 128, 128, 0.1);\n"
+"    }\n"
+"\n"
+"    body {\n"
+"        background: var(--bg-color);\n"
+"        color: var(--text-color);\n"
+"        font-family: var(--font-stack);\n"
+"        padding: 16px;\n"
+"        margin: 0;\n"
+"        font-size: 14px;\n"
+"        line-height: 1.6;\n"
+"    }\n"
+"\n"
+"    /* Messages */\n"
+"    .message {\n"
+"        margin-bottom: 16px;\n"
+"        padding: 12px 16px;\n"
+"        border-left: 3px solid transparent; /* Default no border */\n"
+"        border-radius: 12px;\n"
+"        animation: fadeIn 0.3s ease;\n"
+"    }\n"
+"    .user {\n"
+"        background: var(--msg-user-bg);\n"
+"        color: var(--msg-user-text);\n"
+"        border-color: var(--msg-user-border);\n"
+"    }\n"
+"    .assistant {\n"
+"        background: var(--msg-ai-bg);\n"
+"        color: var(--msg-ai-text);\n"
+"        border-color: var(--msg-ai-border);\n"
+"    }\n"
+"    \n"
+"    .role {\n"
+"        font-weight: 600;\n"
+"        font-size: 11px;\n"
+"        text-transform: uppercase;\n"
+"        letter-spacing: 0.5px;\n"
+"        margin-bottom: 6px;\n"
+"        opacity: 0.8;\n"
+"    }\n"
+"    .user .role { color: var(--msg-user-border); }\n"
+"    .assistant .role { color: var(--msg-ai-border); }\n"
+"\n"
+"    /* Content Typography */\n"
+"    .content p { margin: 8px 0; }\n"
+"    .content h1, .content h2, .content h3 { \n"
+"        margin: 20px 0 12px 0; \n"
+"        font-weight: 600; \n"
+"        color: inherit;\n"
+"    }\n"
+"    .content h1 { font-size: 1.5em; border-bottom: 1px solid var(--table-border); padding-bottom: 8px; }\n"
+"    .content h2 { font-size: 1.3em; }\n"
+"    .content h3 { font-size: 1.1em; }\n"
+"    \n"
+"    .content ul, .content ol { padding-left: 20px; }\n"
+"    .content li { margin: 4px 0; }\n"
+"    .content a { color: #58a6ff; text-decoration: none; }\n"
+"    .content a:hover { text-decoration: underline; }\n"
+"\n"
+"    /* Code Blocks */\n"
+"    pre {\n"
+"        background: var(--code-bg);\n"
+"        padding: 12px;\n"
+"        border-radius: var(--border-radius);\n"
+"        overflow-x: auto;\n"
+"        font-family: var(--mono-font);\n"
+"        font-size: 13px;\n"
+"        margin: 12px 0;\n"
+"        border: 1px solid rgba(128,128,128,0.2);\n"
+"    }\n"
+"    code {\n"
+"        font-family: var(--mono-font);\n"
+"        background: rgba(128,128,128,0.15);\n"
+"        padding: 2px 4px;\n"
+"        border-radius: 4px;\n"
+"        font-size: 0.9em;\n"
+"    }\n"
+"    pre code {\n"
+"        background: transparent;\n"
+"        padding: 0;\n"
+"        border-radius: 0;\n"
+"    }\n"
+"\n"
+"    /* Tables */\n"
+"    table {\n"
+"        border-collapse: collapse;\n"
+"        width: 100%;\n"
+"        margin: 16px 0;\n"
+"        font-size: 13px;\n"
+"    }\n"
+"    th, td {\n"
+"        border-bottom: 1px solid var(--table-border);\n"
+"        padding: 8px 12px;\n"
+"        text-align: left;\n"
+"    }\n"
+"    th {\n"
+"        background: var(--th-bg);\n"
+"        font-weight: 600;\n"
+"        border-bottom: 2px solid var(--table-border);\n"
+"    }\n"
+"\n"
+"    /* Buttons (Default Dark) */\n"
+"    button {\n"
+"        background-color: rgba(128, 128, 128, 0.15);\n"
+"        color: inherit;\n"
+"        border: 1px solid rgba(128, 128, 128, 0.2);\n"
+"        padding: 6px 14px;\n"
+"        border-radius: 4px;\n"
+"        cursor: pointer;\n"
+"        font-family: inherit;\n"
+"        font-weight: 500;\n"
+"        transition: all 0.2s;\n"
+"    }\n"
+"    button:hover {\n"
+"        background-color: rgba(128, 128, 128, 0.25);\n"
+"    }\n"
+"    \n"
+"    /* Light Theme Button Overrides */\n"
+"    body.light-theme button {\n"
+"        background-color: #ffffff;\n"
+"        border: 1px solid #e5e7eb;\n"
+"        color: #1f2937;\n"
+"    }\n"
+"    body.light-theme button:hover {\n"
+"        background-color: #f3f4f6;\n"
+"        border-color: #d1d5db;\n"
+"    }\n"
+"\n"
+"    /* Thinking Box */\n"
+"    .thinking-box {\n"
+"        border: 1px solid rgba(128, 128, 128, 0.15);\n"
+"        border-radius: var(--border-radius);\n"
+"        margin: 12px 0;\n"
+"        background: rgba(128,128,128,0.05);\n"
+"    }\n"
+"    .thinking-header {\n"
+"        padding: 8px 12px;\n"
+"        cursor: pointer;\n"
+"        font-size: 12px;\n"
+"        font-weight: 600;\n"
+"        opacity: 0.7;\n"
+"        display: flex;\n"
+"        align-items: center;\n"
+"        gap: 6px;\n"
+"    }\n"
+"    .thinking-header:hover { opacity: 1; }\n"
+"    \n"
+"    /* Animations */\n"
+"    @keyframes fadeIn {\n"
+"        from { opacity: 0; transform: translateY(5px); }\n"
+"        to { opacity: 1; transform: translateY(0); }\n"
+"    }\n"
+"    @keyframes pulse {\n"
+"        0% { opacity: 1; }\n"
+"        50% { opacity: 0.5; }\n"
+"        100% { opacity: 1; }\n"
+"    }\n"
+"\n"
+"    /* Mermaid Overrides (keep existing for now) */\n"
+"    g.mindmap-node text {\n"
+"      fill: var(--primaryTextColor) !important;\n"
+"    }\n"
+"    g.mindmap-node rect, g.mindmap-node circle, g.mindmap-node polygon, g.mindmap-node path {\n"
+"        stroke: var(--primaryBorderColor) !important;\n"
+"        stroke-width: 2px !important;\n"
+"        fill: var(--primaryColor) !important;\n"
+"    }\n"
+"    .node rect, .node circle, .node polygon, .node path {\n"
+"        fill: var(--primaryColor) !important;\n"
+"        stroke: var(--primaryBorderColor) !important;\n"
+"        stroke-width: 2px !important;\n"
+"    }\n"
+"    .node .label {\n"
+"        color: var(--primaryTextColor) !important;\n"
+"        fill: var(--primaryTextColor) !important;\n"
+"    }\n"
+"    .edgePath .path {\n"
+"        stroke: var(--line-color) !important;\n"
+"        stroke-width: 2px !important;\n"
+"    }\n"
+"    .edgeLabel {\n"
+"        background-color: var(--bg-color) !important;\n"
+"        color: var(--line-color) !important;\n"
+"    }\n"
+"    .thinking-header::before {\n"
+"        content: '▶';\n"
+"        font-size: 0.8em;\n"
+"        transition: transform 0.2s;\n"
+"    }\n"
+"    .thinking-box.expanded .thinking-header::before {\n"
+"        transform: rotate(90deg);\n"
+"    }\n"
+"    .thinking-content {\n"
+"        padding: 10px;\n"
+"        background: var(--code-bg);\n"
+"        display: none;\n"
+"        font-family: 'Fira Code', monospace;\n"
+"        font-size: 0.9em;\n"
+"        color: var(--text-color);\n"
+"        opacity: 0.8;\n"
+"        white-space: pre-wrap;\n"
+"    }\n"
+"    .thinking-box.expanded .thinking-content {\n"
+"        display: block;\n"
+"    }\n"
+"    .mermaid-loading {\n"
+"        padding: 20px;\n"
+"        text-align: center;\n"
+"        color: var(--em-color);\n"
+"        font-style: italic;\n"
+"        border: 1px dashed var(--table-border);\n"
+"        border-radius: 8px;\n"
+"        margin: 10px 0;\n"
+"        background: var(--code-bg);\n"
+"    }\n"
+"    .mermaid-loading::after {\n"
+"        content: \" ⏳\";\n"
+"        animation: pulse 1s infinite;\n"
+"    }\n"
+"</style>\n"
+"<script src='https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js'></script>\n"
+"<script>\n"
+"function setTheme(theme) {\n"
+"    if (theme === 'light') {\n"
+"        document.body.classList.add('light-theme');\n"
+"    } else {\n"
+"        document.body.classList.remove('light-theme');\n"
+"    }\n"
+"}\n"
+"function setCustomColors(bg, fg) {\n"
+"    document.documentElement.style.setProperty('--bg-color', bg);\n"
+"    document.documentElement.style.setProperty('--text-color', fg);\n"
+"    document.documentElement.style.setProperty('--code-bg', bg);\n"
+"}\n"
+"function toggleThinking(header) {\n"
+"    header.parentElement.classList.toggle('expanded');\n"
+"}\n"
+"mermaid.initialize({ \n"
+"  startOnLoad: true, \n"
+"  theme: 'dark', \n"
+"  securityLevel: 'loose',\n"
+"  themeVariables: { \n"
+"    darkMode: true,\n"
+"    background: '#292c37',\n"
+"    fontFamily: 'Segoe UI, sans-serif',\n"
+"    fontSize: '16px',\n"
+"    primaryColor: '#fddeae',        /* Light Cream Node Background */\n"
+"    primaryTextColor: '#161915',    /* Dark Blackish Text */\n"
+"    primaryBorderColor: '#161915',  /* Dark Blackish Border */\n"
+"    lineColor: '#ffffff',           /* White Lines */\n"
+"    secondaryColor: '#fddeae',\n"
+"    tertiaryColor: '#fddeae',\n"
+"    mainBkg: '#292c37',\n"
+"    nodeBorder: '#161915',\n"
+"    clusterBkg: '#fddeae',\n"
+"    clusterBorder: '#161915',\n"
+"    titleColor: '#161915',          /* Dark Title on Cream Cluster */\n"
+"    edgeLabelBackground: '#292c37', /* Match App Background */\n"
+"    actorBorder: '#161915',\n"
+"    actorBkg: '#fddeae',\n"
+"    actorTextColor: '#161915',\n"
+"    signalColor: '#ffffff',\n"
+"    signalTextColor: '#ffffff',     /* White Text on Dark Background */\n"
+"    labelBoxBkgColor: '#fddeae',\n"
+"    labelBoxBorderColor: '#161915',\n"
+"    labelTextColor: '#161915',\n"
+"    loopTextColor: '#161915',\n"
+"    noteBorderColor: '#161915',\n"
+"    noteBkgColor: '#fddeae',\n"
+"    noteTextColor: '#161915'\n"
+"  },\n"
+"  flowchart: { \n"
+"    curve: 'basis', \n"
+"    htmlLabels: true,\n"
+"    padding: 20,\n"
+"    nodeSpacing: 50,\n"
+"    rankSpacing: 50\n"
+"  },\n"
+"  mindmap: {\n"
+"    useMaxWidth: false,\n"
+"    padding: 20\n"
+"  },\n"
+"  sequence: { showSequenceNumbers: true }\n"
+"});\n"
+"</script>\n"
+"</head>\n"
+"<body id='content'></body>\n"
+"</html>";
+
+// Simple markdown-to-HTML converter
+static char* markdown_to_html(const char *text) {
+    if (!text) return g_strdup("");
+    
+    GString *html = g_string_new("");
+    const char *p = text;
+    gboolean in_code_block = FALSE;
+    gboolean in_list = FALSE;
+    gboolean in_think_block = FALSE;
+    
+    while (*p) {
+        // Thinking block <think>
+        if (!in_code_block && strncmp(p, "<think>", 7) == 0) {
+            g_string_append(html, "<div class=\"thinking-box\"><div class=\"thinking-header\" onclick=\"toggleThinking(this)\">Thinking Process</div><div class=\"thinking-content\">");
+            p += 7;
+            in_think_block = TRUE;
+            continue;
+        }
+        
+        if (in_think_block && strncmp(p, "</think>", 8) == 0) {
+            g_string_append(html, "</div></div>");
+            p += 8;
+            in_think_block = FALSE;
+            continue;
+        }
+
+        // Headings (must be at start of line)
+        if ((p == text || *(p-1) == '\n') && *p == '#') {
+            int level = 0;
+            while (*p == '#' && level < 6) {
+                level++;
+                p++;
+            }
+            if (*p == ' ') {
+                p++; // Skip space after #
+                gchar *tag = g_strdup_printf("<h%d>", level > 3 ? 3 : level);
+                g_string_append(html, tag);
+                g_free(tag);
+                
+                while (*p && *p != '\n') {
+                    g_string_append_c(html, *p++);
+                }
+                
+                tag = g_strdup_printf("</h%d>", level > 3 ? 3 : level);
+                g_string_append(html, tag);
+                g_free(tag);
+                
+                if (*p == '\n') p++;
+                continue;
+            }
+        }
+        
+        // Code blocks ```
+        if (!in_code_block && strncmp(p, "```", 3) == 0) {
+            p += 3;
+            // Check language specifier
+            char lang[32] = {0};
+            int i = 0;
+            const char *temp = p;
+            while (*temp && *temp != '\n' && i < 31) {
+                if (*temp != ' ' && *temp != '\r') lang[i++] = *temp;
+                temp++;
+            }
+            p = temp;
+            if (*p == '\n') p++;
+            
+            if (strcmp(lang, "mermaid") == 0) {
+                // Check if the block is closed
+                const char *closing = strstr(p, "```");
+                
+                if (closing) {
+                    g_string_append(html, "<div class=\"mermaid\">");
+                    const char *mermaid_start = p;
+                    
+                    // Mermaid content needs to be clean for parsing
+                    while (p < closing) {
+                        // Fix common AI syntax error: -->|text|> should be -->|text|
+                        if (*p == '|' && *(p+1) == '>') {
+                            g_string_append_c(html, '|');
+                            p += 2;
+                            continue;
+                        }
+                        
+                        // Do NOT escape characters in Mermaid blocks - pass raw content
+                        // The output is rendered by mermaid.js client-side, which parses the graph definition
+                        // Escaping < to &lt; breaks subgraph syntax and node styling
+                        g_string_append_c(html, *p);
+                        p++;
+                    }
+                    g_print("DEBUG: Mermaid Block Raw:\n%.*s\nEND DEBUG\n", (int)(closing - mermaid_start), mermaid_start);
+                    
+                    g_string_append(html, "</div>");
+                    p += 3; // Skip closing ```
+                } else {
+                    // Block is incomplete (streaming), show loading state
+                    g_string_append(html, "<div class=\"mermaid-loading\">Generating Diagram...</div>");
+                    // Skip to end of string
+                    p += strlen(p);
+                }
+                continue;
+            } else {
+                g_string_append(html, "<pre><code class=\"language-");
+                g_string_append(html, lang[0] ? lang : "text");
+                g_string_append(html, "\">");
+                in_code_block = TRUE;
+                continue;
+            }
+        }
+        
+        if (in_code_block && strncmp(p, "```", 3) == 0) {
+            g_string_append(html, "</code></pre>\n");
+            p += 3;
+            in_code_block = FALSE;
+            continue;
+        }
+        
+        if (in_code_block) {
+            // Escape HTML in code blocks
+            if (*p == '<') g_string_append(html, "&lt;");
+            else if (*p == '>') g_string_append(html, "&gt;");
+            else if (*p == '&') g_string_append(html, "&amp;");
+            else g_string_append_c(html, *p);
+            p++;
+            continue;
+        }
+        
+        // Tables (detect | at start of line or after newline)
+        if ((*p == '|' && (p == text || *(p-1) == '\n')) || 
+            (p > text && *(p-1) == '\n' && *p == '|')) {
+            // Found potential table
+            // const char *line_start = p; // Unused
+            const char *line_end = strchr(p, '\n');
+            if (!line_end) line_end = p + strlen(p);
+            
+            // Count columns
+            int cols = 0;
+            for (const char *t = p; t < line_end; t++) {
+                if (*t == '|') cols++;
+            }
+            cols = cols > 0 ? cols - 1 : 0;
+            
+            if (cols > 0) {
+                g_string_append(html, "<table>");
+                
+                // Parse header row
+                g_string_append(html, "<thead><tr>");
+                p++; // Skip first |
+                
+                for (int col = 0; col < cols && p < line_end; col++) {
+                    while (*p == ' ') p++; // Skip spaces
+                    g_string_append(html, "<th>");
+                    
+                    while (p < line_end && *p != '|') {
+                        if (*p != ' ' || (p+1 < line_end && *(p+1) != '|')) {
+                            g_string_append_c(html, *p);
+                        }
+                        p++;
+                    }
+                    
+                    g_string_append(html, "</th>");
+                    if (*p == '|') p++;
+                }
+                g_string_append(html, "</tr></thead>");
+                
+                // Skip separator line (|---|---|)
+                if (*p == '\n') p++;
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') p++;
+                
+                // Parse body rows
+                g_string_append(html, "<tbody>");
+                while (*p && *p == '|') {
+                    g_string_append(html, "<tr>");
+                    p++; // Skip first |
+                    
+                    line_end = strchr(p, '\n');
+                    if (!line_end) line_end = p + strlen(p);
+                    
+                    for (int col = 0; col < cols && p < line_end; col++) {
+                        while (*p == ' ') p++; // Skip spaces
+                        g_string_append(html, "<td>");
+                        
+                        while (p < line_end && *p != '|') {
+                            if (*p != ' ' || (p+1 < line_end && *(p+1) != '|')) {
+                                g_string_append_c(html, *p);
+                            }
+                            p++;
+                        }
+                        
+                        g_string_append(html, "</td>");
+                        if (*p == '|') p++;
+                    }
+                    g_string_append(html, "</tr>");
+                    
+                    if (*p == '\n') p++;
+                }
+                g_string_append(html, "</tbody></table>\n");
+                continue;
+            }
+        }
+        
+        // Inline code `
+        if (*p == '`') {
+            const char *end = strchr(p + 1, '`');
+            if (end) {
+                g_string_append(html, "<code>");
+                p++;
+                while (p < end) {
+                    if (*p == '<') g_string_append(html, "&lt;");
+                    else if (*p == '>') g_string_append(html, "&gt;");
+                    else g_string_append_c(html, *p);
+                    p++;
+                }
+                g_string_append(html, "</code>");
+                p++; // Skip closing `
+                continue;
+            }
+        }
+        
+        // Bold **text**
+        if (strncmp(p, "**", 2) == 0) {
+            const char *end = strstr(p + 2, "**");
+            if (end) {
+                g_string_append(html, "<strong>");
+                p += 2;
+                // Process italic within bold
+                while (p < end) {
+                    if (*p == '*' && *(p+1) != '*') {
+                        const char *italic_end = strchr(p + 1, '*');
+                        if (italic_end && italic_end < end) {
+                            g_string_append(html, "<em>");
+                            p++;
+                            while (p < italic_end) g_string_append_c(html, *p++);
+                            g_string_append(html, "</em>");
+                            p++;
+                            continue;
+                        }
+                    }
+                    g_string_append_c(html, *p++);
+                }
+                g_string_append(html, "</strong>");
+                p += 2;
+                continue;
+            }
+        }
+        
+        // Italic *text*
+        if (*p == '*' && *(p+1) != '*') {
+            const char *end = strchr(p + 1, '*');
+            if (end) {
+                g_string_append(html, "<em>");
+                p++;
+                while (p < end) {
+                    g_string_append_c(html, *p++);
+                }
+                g_string_append(html, "</em>");
+                p++;
+                continue;
+            }
+        }
+        
+        // Lists
+        if (*p == '-' && (p == text || *(p-1) == '\n') && *(p+1) == ' ') {
+            if (!in_list) {
+                g_string_append(html, "<ul>");
+                in_list = TRUE;
+            }
+            g_string_append(html, "<li>");
+            p += 2;
+            
+            // Process inline formatting within list item
+            const char *line_end = strchr(p, '\n');
+            if (!line_end) line_end = p + strlen(p);
+            
+            while (p < line_end) {
+                // Bold **text**
+                if (p < line_end - 1 && strncmp(p, "**", 2) == 0) {
+                    const char *end = p + 2;
+                    while (end < line_end - 1 && strncmp(end, "**", 2) != 0) end++;
+                    if (end < line_end - 1) {
+                        g_string_append(html, "<strong>");
+                        p += 2;
+                        // Process italic within bold
+                        while (p < end) {
+                            if (*p == '*' && *(p+1) != '*') {
+                                const char *italic_end = strchr(p + 1, '*');
+                                if (italic_end && italic_end < end) {
+                                    g_string_append(html, "<em>");
+                                    p++;
+                                    while (p < italic_end) g_string_append_c(html, *p++);
+                                    g_string_append(html, "</em>");
+                                    p++;
+                                    continue;
+                                }
+                            }
+                            g_string_append_c(html, *p++);
+                        }
+                        g_string_append(html, "</strong>");
+                        p += 2;
+                        continue;
+                    }
+                }
+                
+                // Italic *text*
+                if (p < line_end && *p == '*' && *(p+1) != '*') {
+                    const char *end = strchr(p + 1, '*');
+                    if (end && end < line_end) {
+                        g_string_append(html, "<em>");
+                        p++;
+                        while (p < end) g_string_append_c(html, *p++);
+                        g_string_append(html, "</em>");
+                        p++;
+                        continue;
+                    }
+                }
+                
+                // Inline code `text`
+                if (p < line_end && *p == '`') {
+                    const char *end = strchr(p + 1, '`');
+                    if (end && end < line_end) {
+                        g_string_append(html, "<code>");
+                        p++;
+                        while (p < end) {
+                            if (*p == '<') g_string_append(html, "&lt;");
+                            else if (*p == '>') g_string_append(html, "&gt;");
+                            else g_string_append_c(html, *p);
+                            p++;
+                        }
+                        g_string_append(html, "</code>");
+                        p++;
+                        continue;
+                    }
+                }
+                
+                g_string_append_c(html, *p++);
+            }
+            
+            g_string_append(html, "</li>");
+            if (*p == '\n') p++;
+            continue;
+        }
+        
+        // Close list if needed
+        if (in_list && *p == '\n' && *(p+1) != '-') {
+            g_string_append(html, "</ul>");
+            in_list = FALSE;
+        }
+        
+        // Paragraphs (double newline)
+        if (*p == '\n' && *(p+1) == '\n') {
+            g_string_append(html, "<br><br>");
+            p += 2;
+            continue;
+        }
+        
+        // Regular characters
+        if (*p == '<') g_string_append(html, "&lt;");
+        else if (*p == '>') g_string_append(html, "&gt;");
+        else if (*p == '&') g_string_append(html, "&amp;");
+        else if (*p == '\n') g_string_append(html, "<br>");
+        else g_string_append_c(html, *p);
+        
+        p++;
+    }
+    
+    if (in_list) g_string_append(html, "</ul>");
+    if (in_code_block) g_string_append(html, "</code></pre>");
+    
+    return g_string_free(html, FALSE);
+}
+
+static char* str_replace(const char *orig, const char *rep, const char *with) {
+    char *result;
+    char *ins;
+    char *tmp;
+    int len_rep;
+    int len_with;
+    int len_front;
+    int count;
+
+    if (!orig || !rep)
+        return g_strdup(orig);
+    len_rep = strlen(rep);
+    if (len_rep == 0)
+        return g_strdup(orig);
+    if (!with)
+        with = "";
+    len_with = strlen(with);
+
+    ins = (char*)orig;
+    for (count = 0; (tmp = strstr(ins, rep)); ++count) {
+        ins = tmp + len_rep;
+    }
+
+    tmp = result = g_malloc(strlen(orig) + (len_with - len_rep) * count + 1);
+
+    if (!result)
+        return g_strdup(orig);
+
+    while (count--) {
+        ins = strstr(orig, rep);
+        len_front = ins - orig;
+        tmp = strncpy(tmp, orig, len_front) + len_front;
+        tmp = strcpy(tmp, with) + len_with;
+        orig += len_front + len_rep;
+    }
+    strcpy(tmp, orig);
+    return result;
+}
+// Create WebView widget
+GtkWidget* create_ai_webview(void) {
+    // Get current user colors
+    GdkRGBA solid_bg = current_settings.ai_panel_background_color;
+    solid_bg.alpha = 1.0;  // Force solid for AI panel background
+    
+    // Convert all colors to strings
+    char *bg_hex = gdk_rgba_to_string(&solid_bg);
+    char *text_hex = gdk_rgba_to_string(&current_settings.ai_panel_text_color);
+    
+    char *user_bg = gdk_rgba_to_string(&current_settings.ai_user_msg_bg_color);
+    char *user_text = gdk_rgba_to_string(&current_settings.ai_user_msg_text_color);
+    
+    char *ai_bg = gdk_rgba_to_string(&current_settings.ai_assistant_msg_bg_color);
+    char *ai_text = gdk_rgba_to_string(&current_settings.ai_assistant_msg_text_color);
+    
+    // Build CSS overrides
+    char *css_overrides = g_strdup_printf(
+        "<style>\n"
+        "  :root {\n"
+        "    --bg-color: %s;\n"
+        "    --text-color: %s;\n"
+        "    --msg-user-bg: %s;\n"
+        "    --msg-user-text: %s;\n"
+        "    --msg-ai-bg: %s;\n"
+        "    --msg-ai-text: %s;\n"
+        "  }\n"
+        "</style>\n",
+        bg_hex, text_hex, user_bg, user_text, ai_bg, ai_text
+    );
+    
+    // Inject overrides into HTML template (insert before </head>)
+    // This allows our custom colors to override the defaults in the template
+    // We need to construct the replacement string
+    // We need to construct the replacement string
+    char *replacement = g_strdup_printf("%s</head>", css_overrides);
+    char *final_html = str_replace(HTML_TEMPLATE, "</head>", replacement);
+    
+    g_free(css_overrides);
+    g_free(replacement);
+    
+    // Create WebView
+    WebKitWebView *webview = WEBKIT_WEB_VIEW(webkit_web_view_new());
+    
+    // Set GTK widget background color (to match)
+    webkit_web_view_set_background_color(webview, &solid_bg);
+    
+    // Enable developer extras
+    WebKitSettings *settings = webkit_web_view_get_settings(webview);
+    webkit_settings_set_enable_developer_extras(settings, TRUE);
+    webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+    
+    // Load HTML with user's colors pre-injected
+    webkit_web_view_load_html(webview, final_html, NULL);
+    
+    // Cleanup
+    g_free(final_html);
+    g_free(bg_hex);
+    g_free(text_hex);
+    g_free(user_bg);
+    g_free(user_text);
+    g_free(ai_bg);
+    g_free(ai_text);
+    
+    return GTK_WIDGET(webview);
+}
+
+// Helper function to replace all occurrences of a substring
+
+// Append message to WebView
+void webview_append_message(GtkWidget *webview, const char *role, const char *content) {
+    if (!webview || !content) return;
+    
+    char *html_content = markdown_to_html(content);
+    
+    const char *role_label = strcmp(role, "user") == 0 ? "👤 You" : "🤖 AI";
+    const char *role_class = strcmp(role, "user") == 0 ? "user" : "assistant";
+    
+    // Escape single quotes in HTML content for JavaScript string
+    GString *escaped = g_string_new("");
+    for (const char *p = html_content; *p; p++) {
+        if (*p == '\'') {
+            g_string_append(escaped, "\\'");
+        } else if (*p == '\n') {
+            g_string_append(escaped, "\\n");
+        } else if (*p == '\\') {
+            g_string_append(escaped, "\\\\");
+        } else {
+            g_string_append_c(escaped, *p);
+        }
+    }
+    
+    gchar *script = g_strdup_printf(
+        "var div = document.createElement('div');"
+        "div.className = 'message %s';"
+        "div.innerHTML = '<div class=\"role\">%s</div><div class=\"content\">%s</div>';"
+        "document.getElementById('content').appendChild(div);"
+        "var nodes = div.querySelectorAll('.mermaid');"
+        "if (nodes.length > 0) {"
+        "  mermaid.run({ nodes: nodes }).catch(function(err) { console.error('Mermaid Error:', JSON.stringify(err)); });"
+        "}"
+        "window.scrollTo(0, document.body.scrollHeight);",
+        role_class, role_label, escaped->str
+    );
+    
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(webview), script, -1, NULL, NULL, NULL, NULL, NULL);
+    
+    g_string_free(escaped, TRUE);
+    g_free(html_content);
+    g_free(script);
+}
+
+void webview_start_ai_message(GtkWidget *webview) {
+    if (!webview) return;
+    
+    const char *script = 
+        "var old = document.getElementById('current-ai-response');"
+        "if (old) old.removeAttribute('id');"
+        "var div = document.createElement('div');"
+        "div.className = 'message assistant';"
+        "div.id = 'current-ai-response';"
+        "div.innerHTML = '<div class=\"role\">🤖 AI</div><div class=\"content\"></div>';"
+        "document.getElementById('content').appendChild(div);"
+        "window.scrollTo(0, document.body.scrollHeight);";
+        
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(webview), script, -1, NULL, NULL, NULL, NULL, NULL);
+}
+
+void webview_update_ai_message(GtkWidget *webview, const char *content) {
+    if (!webview || !content) return;
+    
+    char *html_content = markdown_to_html(content);
+    
+    GString *escaped = g_string_new("");
+    for (const char *p = html_content; *p; p++) {
+        if (*p == '\'') {
+            g_string_append(escaped, "\\'");
+        } else if (*p == '\n') {
+            g_string_append(escaped, "\\n");
+        } else if (*p == '\\') {
+            g_string_append(escaped, "\\\\");
+        } else {
+            g_string_append_c(escaped, *p);
+        }
+    }
+    
+    // Update the content of the div with id 'current-ai-response'
+    // And remove the id so future messages don't conflict (though we assume one stream at a time)
+    // Better: Always target the LAST element with class 'assistant' or just keep using the ID and remove it when starting a new one?
+    // Let's just target 'current-ai-response' which we created in start_ai_message.
+    
+    gchar *script = g_strdup_printf(
+        "var div = document.getElementById('current-ai-response');"
+        "if (div) {"
+        "  var contentDiv = div.querySelector('.content');"
+        "  if (contentDiv) contentDiv.innerHTML = '%s';"
+        "  var nodes = contentDiv.querySelectorAll('.mermaid');"
+        "  if (nodes.length > 0) {"
+        "    mermaid.run({ nodes: nodes }).catch(function(err) { console.error('Mermaid Error:', JSON.stringify(err)); });"
+        "  }"
+        "  window.scrollTo(0, document.body.scrollHeight);"
+        "}",
+        escaped->str
+    );
+    
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(webview), script, -1, NULL, NULL, NULL, NULL, NULL);
+    
+    g_string_free(escaped, TRUE);
+    g_free(html_content);
+    g_free(script);
+}
+
+void webview_set_theme(GtkWidget *webview, const char *theme) {
+    char *script = g_strdup_printf("setTheme('%s');", theme);
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(webview), script, -1, NULL, NULL, NULL, NULL, NULL);
+    g_free(script);
+}
+
+void webview_set_custom_theme(GtkWidget *webview, const char *bg_color, const char *fg_color) {
+    char *script = g_strdup_printf(
+        "if (typeof setCustomColors === 'function') { setCustomColors('%s', '%s'); }", 
+        bg_color, fg_color
+    );
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(webview), script, -1, NULL, NULL, NULL, NULL, NULL);
+    g_free(script);
+}
+
+// Clear WebView
+void webview_clear(GtkWidget *webview) {
+    if (!webview) return;
+    
+    webkit_web_view_evaluate_javascript(
+        WEBKIT_WEB_VIEW(webview),
+        "document.getElementById('content').innerHTML = '';",
+        -1, NULL, NULL, NULL, NULL, NULL
+    );
+}
+
+// Load conversation history
+void webview_load_conversation(GtkWidget *webview, GPtrArray *messages) {
+    if (!webview || !messages) return;
+    
+    webview_clear(webview);
+    
+    for (guint i = 0; i < messages->len; i++) {
+        Message *msg = g_ptr_array_index(messages, i);
+        webview_append_message(webview, msg->role, msg->content);
+    }
+}

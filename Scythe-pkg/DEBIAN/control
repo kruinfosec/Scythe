@@ -1,0 +1,7 @@
+Package: scythe
+Version: 2.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Kru Infosec <kru.infosec254@gmail.com>
+Description: Scythe -- a Linux desktop application designed to enhance penetration testing and bug bounty workflows. Spin up multiple terminal sessions, run automated Nmap and Nikto scans with a single click, and generate detailed HTML/PDF reports—all within the app. Integrated LLaMA 3 AI provides instant guidance, allowing you to ask follow-up questions during tests and get real-time answers without leaving the interface.

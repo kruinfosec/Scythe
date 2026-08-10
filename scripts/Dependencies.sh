@@ -6,11 +6,20 @@ sudo apt update && sudo apt upgrade -y
 echo "📦 Installing compiler and build tools..."
 sudo apt install -y build-essential pkg-config curl git
 
-echo "📚 Installing required development libraries..."
-sudo apt install -y libgtk-3-dev libvte-2.91-dev libsoup2.4-dev libjson-glib-dev
+echo "For Debian/Ubuntu:"
+sudo apt-get install -y libgtk-3-dev \
+                         libvte-2.91-dev \
+                         libjson-glib-1.0-dev \
+                         libsoup2.4-dev \
+                         uuid-dev \
+                         libhpdf-dev \
+                         libwebkit2gtk-4.1-dev
 
 echo "🧰 Installing runtime tools..."
-sudo apt install -y bash python3
+sudo apt install -y bash python3 sqlite3 libsqlite3-dev
+
+echo "🐍 Installing Python libraries..."
+pip install sqlalchemy
 
 echo "🛠 Installing automation tools (Nikto, Nmap)..."
 sudo apt install -y nikto nmap

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Name=Scythe
+Comment=Vulnerability & Security Testing Terminal
+Exec=scythe-fixed
+Icon=scythe
+Terminal=false
+Type=Application
+Categories=Utility;Development;Security;
+StartupWMClass=scythe-terminal
+Keywords=security;terminal;vulnerability;scanner;

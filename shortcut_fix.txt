@@ -1,0 +1,33 @@
+                          if (ai_panel) {
+                              gboolean visible = gtk_widget_get_visible(ai_panel);
+                              
+                              // Sync with ai_panel_visible state (from ai.c)
+                              extern gboolean ai_panel_visible;
+                              extern gint last_paned_position;
+                              
+                              if (visible) {
+                                  // CLOSING: Save position, hide panel
+                                  last_paned_position = gtk_paned_get_position(GTK_PANED(hpaned));
+                                  gtk_widget_set_visible(ai_panel, FALSE);
+                                  // Move paned to max to fully hide
+                                  gint max_pos = gtk_widget_get_allocated_width(hpaned);
+                                  gtk_paned_set_position(GTK_PANED(hpaned), max_pos);
+                                  ai_panel_visible = FALSE;
+                                  
+                                  // Return focus to terminal
+                                  VteTerminal *terminal = get_current_terminal(notebook);
+                                  if (terminal) {
+                                      gtk_widget_grab_focus(GTK_WIDGET(terminal));
+                                  }
+                              } else {
+                                  // OPENING: Restore position, show panel
+                                  gtk_paned_set_position(GTK_PANED(hpaned), last_paned_position);
+                                  gtk_widget_set_visible(ai_panel, TRUE);
+                                  ai_panel_visible = TRUE;
+                                  
+                                  // Auto-focus AI entry
+                                  if (ai_entry_widget) {
+                                      gtk_widget_grab_focus(ai_entry_widget);
+                                  }
+                              }
+                          }

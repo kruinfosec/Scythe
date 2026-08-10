@@ -1,0 +1,98 @@
+1. Supercharge Your CVE Mapping (High Impact)
+
+   * Why: Currently, the server.py (EXTSEC) script has a very basic, hardcoded CVE check. You have a much more
+     powerful CVE-Lookup.py script that isn't being used to its full potential.
+   * How:
+       1. In server.py, modify the fingerprint_web_tech and check_cve_mapping functions. After you identify a server
+          or technology (e.g., "Apache", "nginx", "React"), extract its version if available.
+       2. Use Python's subprocess module to call your CVE-Lookup.py script with the discovered technology as a
+          keyword. For example: subprocess.run(["python3", "CVE-Lookup.py", "search", "Apache 2.4.51"], ...)
+       3. To make this seamless, you could add a --json flag to CVE-Lookup.py that makes it output results in a
+          machine-readable JSON format. Your server.py script can then easily parse this JSON and embed the rich CVE
+          data directly into the final report.
+   * Files to Modify: server.py, CVE-Lookup.py.
+
+  2. Enhance Subdomain Enumeration
+
+   * Why: The current enumeration uses a small, hardcoded list of common subdomains. Real-world assessments require
+     more comprehensive techniques.
+   * How:
+       * (Easy): Replace the hardcoded list with a much larger one from a well-known source like the SecLists 
+         (https://github.com/danielmiessler/SecLists/tree/master/Discovery/DNS) project. You could include a
+         medium-sized list directly in your repository and have server.py read from it.
+       * (Advanced): Integrate a dedicated tool. Add subfinder or amass to your Dependencies.sh script. Then, in
+         server.py, use subprocess to run a command like amass enum -passive -d {domain} and parse the output. This
+         will yield significantly better results by querying passive DNS sources.
+   * Files to Modify: server.py, Dependencies.sh.
+
+  3. Integrate Modern Web Scanning with Nuclei
+
+   * Why: Nikto is a classic, but the industry is rapidly adopting template-based scanners like Nuclei 
+     (https://github.com/projectdiscovery/nuclei) for fast, accurate, and highly customizable vulnerability
+     detection.
+   * How:
+       1. Add nuclei to your Dependencies.sh installation script.
+       2. In server.py, create a new function run_nuclei_scan(domain).
+       3. Use subprocess to execute a command like nuclei -u {domain} -severity critical,high,medium -silent. The
+          -silent flag provides clean, parseable output.
+       4. Add a new "Nuclei Scan Results" section to your report, clearly separating these findings from the Nikto
+          results.
+   * Files to Modify: server.py, Dependencies.sh.
+
+  4. Implement PDF Reporting
+
+   * Why: Your README.md mentions ReportLab for PDF reporting, which is a great idea for professional deliverables,
+     but it's not yet implemented.
+   * How:
+       1. Ensure reportlab is installed via pip in your Dependencies.sh script.
+       2. In server.py, create a new function generate_pdf_report(data). This function will take all the collected
+          information (WHOIS, DNS, scan results, etc.) as a structured dictionary.
+       3. Use the reportlab library to construct a PDF document. You can create a title page, add headers/footers,
+          and format each section of your report into paragraphs and tables.
+       4. Call this function at the end of the generate_report function to save both the .txt and .pdf files.
+   * Files to Modify: server.py, Dependencies.sh.
+
+  5. Refactor the C Code for Maintainability
+
+   * Why: The embedded_terminal_fixed.c file is becoming very large. As you add more features, it will be harder to
+     manage.
+   * How: Break the C code into logical modules.
+       * main.c: Handles the main application loop and window creation.
+       * terminal_ui.c/.h: Manages all terminal-specific logic (creating tabs, splitting panes, context menus).
+       * ai_assistant.c/.h: Contains all functions related to the AI panel, including the libsoup calls and JSON
+         parsing.
+       * settings.c/.h: Manages loading, saving, and applying user preferences from the settings dialog.
+      This will make the code much cleaner, easier to debug, and simpler to extend in the future.
+   * Files to Modify: All .c files. This is a larger refactoring effort but is a very good practice.
+
+*17. Better script management (categorization, search, favorites)
+18. Custom themes/color schemes
+
+## Additional AI API Integrations (Phase 2)
+
+### Claude (Anthropic) - For Complex Reasoning
+- API: Anthropic API (console.anthropic.com)
+- Models: claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022
+- Use Case: Complex exploit analysis, production-quality code generation
+- Advantage: Superior reasoning, best for multi-step technical tasks
+- Speed: ~40-80 tok/s (slower than Groq but higher quality)
+- Cost: $3-15 per 1M tokens
+
+### Gemini (Google AI) - For Multimodal & Large Context
+- API: Google AI API (ai.google.dev)
+- Models: gemini-2.0-flash-exp, gemini-1.5-pro
+- Use Case: Image analysis (screenshots, diagrams), massive context (1M tokens)
+- Advantage: Multimodal capabilities, huge context window
+- Speed: ~100-200 tok/s
+- Cost: Free tier available, then cheap
+
+**Implementation Notes:**
+- Keep Groq as primary (speed advantage for terminal use)
+- Add Claude/Gemini as optional secondary APIs
+- Requires: API key fields in settings, separate API handlers
+- UI: Model selection should show API source (Groq/Claude/Gemini)
+
+**When to Implement:**
+- After mastering current Groq model selection
+- When specific use cases require Claude's reasoning or Gemini's multimodal
+- Priority: Low (current Groq setup covers most cybersecurity needs)

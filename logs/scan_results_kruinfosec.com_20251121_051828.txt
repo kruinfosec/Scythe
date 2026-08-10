@@ -1,0 +1,108 @@
+🔍 External Security Assessment for: kruinfosec.com
+📅 Date: 2025-11-21 05:24:42
+=========================================
+📄 WHOIS Information
+=========================================
+Domain Name: KRUINFOSEC.COM
+Registrar: Hosting Concepts B.V. d/b/a Registrar.eu
+Creation Date: 2025-09-27
+Expiration Date: 2028-09-27
+Registrant Country: NL
+Name Servers: NS1.DNS-PARKING.COM, NS2.DNS-PARKING.COM
+
+=========================================
+🌐 DNS Records
+=========================================
+A Records:
+  - 216.198.79.1
+MX Records:
+  - 20 mx2.zoho.in.
+  - 10 mx.zoho.in.
+  - 50 mx3.zoho.in.
+TXT Records:
+  - "zoho-verification=zb45801767.zmverify.zoho.in"
+  - "v=spf1 include:zoho.in ~all"
+NS Records:
+  - ns1.dns-parking.com.
+  - ns2.dns-parking.com.
+
+=========================================
+🔎 Subdomain Enumeration
+=========================================
+- www.kruinfosec.com
+
+=========================================
+🔒 SSL/TLS Security Check
+=========================================
+Error: SSL/TLS connection failed: _ssl.c:1016: The handshake operation timed out
+SSL/TLS Version: Unknown
+Certificate Expiry: Unknown
+Issuer: Unknown
+Weak Ciphers: Unknown
+
+=========================================
+🛡️ HTTP Security Headers Audit
+=========================================
+Strict-Transport-Security: HSTS not enabled
+X-Frame-Options: Missing (clickjacking possible)
+X-XSS-Protection: Missing (XSS protection disabled)
+X-Content-Type-Options: Missing (MIME-sniffing possible)
+Content-Security-Policy: Missing (no content restrictions)
+Referrer-Policy: Missing (may leak referrer information)
+Permissions-Policy: Missing (no feature permissions set)
+Server: ⚠️ Vercel (version information exposed)
+
+=========================================
+🚪 Open Ports & Services (Nmap)
+=========================================
+Starting Nmap 7.95 ( https://nmap.org ) at 2025-11-21 05:18 IST
+Nmap scan report for kruinfosec.com (216.198.79.1)
+Host is up (0.011s latency).
+Not shown: 98 filtered tcp ports (no-response)
+PORT    STATE SERVICE
+80/tcp  open  http
+443/tcp open  https
+
+Nmap done: 1 IP address (1 host up) scanned in 2.03 seconds
+
+
+=========================================
+🕵️ Web Technology Fingerprinting
+=========================================
+Server: Vercel
+
+=========================================
+🌐 Web Vulnerability Scan (Nikto)
+=========================================
+Nikto scan timed out after 360 seconds.
+
+=========================================
+⚠️ Security Misconfiguration Checks
+=========================================
+[!] WARNING: Potential admin panel found at /admin (Status: 200)
+[!] WARNING: Potential admin panel found at /wp-admin (Status: 403)
+
+=========================================
+📧 Email Security Records
+=========================================
+SPF Record: v=spf1 include:zoho.in ~all
+DMARC Record: ⚠️ Failed to check
+DKIM Record: ⚠️ Could not verify (may need specific selector)
+
+=========================================
+⚠️ Blacklist & Reputation Checks
+=========================================
+Note: Basic blacklist check only - comprehensive checks recommended
+Spamhaus ZEN: ✅ Not listed
+SORBS: ✅ Not listed
+
+=========================================
+🔎 CVE Mapping
+=========================================
+[*] Server software detected: Vercel
+[*] No known high-severity CVEs identified for the detected version
+
+=========================================
+✅ Scan Complete!
+📝 Report saved to: scan_results_kruinfosec.com_20251121_051828.txt
+=========================================

@@ -36,6 +36,7 @@ Scythe is a comprehensive **CyberSecurity Workbench** designed to streamline mul
 * **💾 Session Logging & Report Generation**: Automatically records terminal sessions, working directories, and executed command outputs to an SQLite3 database. This simplifies tracking your progress and generating structured security assessment reports.
 * **📊 Rich Markdown & Diagram Rendering**: Beautiful WebKitGTK-based chat panel displaying syntax-highlighted code blocks, tables, and collapsible reasoning/thinking blocks, with native interactive **Mermaid.js** diagram generation.
 * **🎨 Deep UI Customization**: Fully configurable colors, fonts, transparency, padding, and custom themes (including seamless synchronization between the dark terminal shell and the AI pane).
+* **📝 Interactive Markdown Notes & System-Wide Snip**: Built-in Markdown notes panel featuring automatic syntax auto-hiding for clean document preview. Integrated with a system-wide snip tool (`Ctrl+Alt+S`) that works globally (even when minimized) to insert captures, adjust alignment, or export report-ready documents to portable Markdown and PDF with native OS portal file dialogs.
 
 ---
 
@@ -238,6 +239,10 @@ Scythe features keybindings that match modern IDE environments:
 | **Split Pane Vertically** | `Ctrl + Shift + R` |
 | **Toggle AI Side Panel** | `Ctrl + Shift + A` |
 | **Open Customization Settings**| `Ctrl + Shift + P` |
+| **Toggle Notes Panel** | `Alt + N` |
+| **Toggle Notes Pin** | `Alt + P` |
+| **Snip Tool (Capture Globally)**| `Ctrl + Alt + S` |
+| **Close Notes Popover (unpinned)**| `Escape` |
 
 > [!NOTE]
 > All keyboard shortcuts can be rebound inside the **Customise** dialog interface under the Keyboard Shortcuts settings tab.

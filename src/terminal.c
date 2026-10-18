@@ -4,6 +4,8 @@
 #include "db.h"
 #include <stdlib.h>
 #include <unistd.h>
+#include <pwd.h>
+#include <sys/types.h>
 
 // Forward declarations
 static void spawn_shell(VteTerminal *terminal);
@@ -20,6 +22,8 @@ static void on_shell_spawned(VteTerminal *terminal, GPid pid, GError *error, gpo
         g_error_free(error);
         return;
     }
+    
+    g_object_set_data(G_OBJECT(terminal), "child_pid", GINT_TO_POINTER((int)pid));
     
     // Register terminal in DB
     int session_id = session_get_current();
@@ -316,6 +320,56 @@ gboolean on_terminal_button_press(GtkWidget *widget, GdkEventButton *event, gpoi
     return FALSE;
 }
 
+// --- Tab rename: commit the inline GtkEntry and restore the label ---
+static void commit_tab_rename(GtkEntry *entry, gpointer user_data) {
+    GtkWidget *hbox = GTK_WIDGET(user_data);
+    GtkWidget *label = GTK_WIDGET(g_object_get_data(G_OBJECT(hbox), "tab-label"));
+    if (!label) return;
+
+    const char *new_text = gtk_entry_get_text(entry);
+    if (new_text && strlen(new_text) > 0) {
+        gtk_label_set_text(GTK_LABEL(label), new_text);
+        g_object_set_data(G_OBJECT(hbox), "custom-title", GINT_TO_POINTER(1));
+    }
+
+    gtk_widget_show(label);
+    gtk_widget_destroy(GTK_WIDGET(entry));
+}
+
+static gboolean on_tab_rename_focus_out(GtkWidget *entry, GdkEventFocus *event, gpointer user_data) {
+    (void)event;
+    commit_tab_rename(GTK_ENTRY(entry), user_data);
+    return FALSE;
+}
+
+static gboolean on_tab_event_box_press(GtkWidget *event_box, GdkEventButton *event, gpointer user_data) {
+    if (event && event->type == GDK_2BUTTON_PRESS && event->button == 1) {
+        GtkWidget *hbox = GTK_WIDGET(user_data);
+        GtkWidget *label = GTK_WIDGET(g_object_get_data(G_OBJECT(hbox), "tab-label"));
+        if (!label) return FALSE;
+
+        const char *current_text = gtk_label_get_text(GTK_LABEL(label));
+        gtk_widget_hide(label);
+
+        GtkWidget *entry = gtk_entry_new();
+        gtk_entry_set_text(GTK_ENTRY(entry), current_text);
+        gtk_entry_set_width_chars(GTK_ENTRY(entry), 15);
+        gtk_widget_set_size_request(entry, 100, -1);
+
+        /* Insert entry before the close button (position 1 in hbox) */
+        gtk_box_pack_start(GTK_BOX(hbox), entry, TRUE, TRUE, 0);
+        gtk_box_reorder_child(GTK_BOX(hbox), entry, 0);
+        gtk_widget_show(entry);
+        gtk_widget_grab_focus(entry);
+
+        g_signal_connect(entry, "activate", G_CALLBACK(commit_tab_rename), hbox);
+        g_signal_connect(entry, "focus-out-event", G_CALLBACK(on_tab_rename_focus_out), hbox);
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
 // Function to create a tab label
 static GtkWidget* create_tab_label(GtkNotebook *notebook, const char *title) {
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
@@ -323,6 +377,12 @@ static GtkWidget* create_tab_label(GtkNotebook *notebook, const char *title) {
     GtkWidget *label = gtk_label_new(title);
     gtk_widget_set_margin_start(label, 3);
     gtk_widget_set_margin_end(label, 3);
+    gtk_label_set_width_chars(GTK_LABEL(label), 18);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 25);
+    gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+    gtk_widget_set_size_request(label, 130, -1);
+
+    g_object_set_data(G_OBJECT(hbox), "tab-label", label);
     
     GtkWidget *close_btn = gtk_button_new();
     GtkWidget *close_label = gtk_label_new("×");
@@ -336,10 +396,169 @@ static GtkWidget* create_tab_label(GtkNotebook *notebook, const char *title) {
     gtk_box_pack_start(GTK_BOX(hbox), close_btn, FALSE, FALSE, 0);
     
     g_signal_connect(close_btn, "clicked", G_CALLBACK(close_tab), notebook);
+
+    /* Wrap in event box for double-click rename */
+    GtkWidget *event_box = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(event_box), FALSE);
+    gtk_container_add(GTK_CONTAINER(event_box), hbox);
+    gtk_widget_add_events(event_box, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(event_box, "button-press-event", G_CALLBACK(on_tab_event_box_press), hbox);
+
+    gtk_widget_show_all(event_box);
     
-    gtk_widget_show_all(hbox);
-    
-    return hbox;
+    return event_box;
+}
+
+// Update tab label when VTE terminal title or current directory changes
+static void update_vte_tab_title(VteTerminal *terminal) {
+    if (!terminal || !GTK_IS_WIDGET(terminal)) return;
+
+    char title_buf[512] = {0};
+    char *path = NULL;
+
+    /* Phase 8 fix: Always try /proc/<pid>/cwd FIRST for the most accurate
+     * real-time working directory. Kernel updates this on every chdir() syscall.
+     * VTE window title is cached and often stale after SSH/su/shell changes. */
+    int child_pid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(terminal), "child_pid"));
+    int pid = child_pid;
+    VtePty *pty = vte_terminal_get_pty(terminal);
+    if (pty != NULL) {
+        int pty_fd = vte_pty_get_fd(pty);
+        if (pty_fd >= 0) {
+            pid_t fg_pgrp = tcgetpgrp(pty_fd);
+            if (fg_pgrp > 0) {
+                pid = fg_pgrp;
+            }
+        }
+    }
+
+    /* Get username and current directory from the actual terminal process */
+    char *username = NULL;
+    if (pid > 0) {
+        /* Read current directory from /proc/<pid>/cwd */
+        char proc_cwd[64];
+        snprintf(proc_cwd, sizeof(proc_cwd), "/proc/%d/cwd", pid);
+        char target[512] = {0};
+        ssize_t rlen = readlink(proc_cwd, target, sizeof(target) - 1);
+        if (rlen > 0) {
+            target[rlen] = '\0';
+            path = g_strdup(target);
+        }
+
+        /* Read username from /proc/<pid>/status (Uid field - use effective UID) */
+        char proc_status[64];
+        snprintf(proc_status, sizeof(proc_status), "/proc/%d/status", pid);
+        FILE *status_file = fopen(proc_status, "r");
+        if (status_file) {
+            char line[256];
+            uid_t real_uid, effective_uid, saved_uid, fs_uid;
+            while (fgets(line, sizeof(line), status_file)) {
+                /* Format: "Uid:\t<real>\t<effective>\t<saved>\t<filesystem>" */
+                if (sscanf(line, "Uid:\t%u\t%u\t%u\t%u", &real_uid, &effective_uid, &saved_uid, &fs_uid) == 4) {
+                    /* Use effective UID - this changes with su/sudo */
+                    struct passwd *pw = getpwuid(effective_uid);
+                    if (pw && pw->pw_name) {
+                        username = g_strdup(pw->pw_name);
+                    }
+                    break;
+                }
+            }
+            fclose(status_file);
+        }
+    }
+
+    /* Fallback 1: VTE current directory URI (shell emits OSC 7 on some distros) */
+    if (!path) {
+        const char *uri = vte_terminal_get_current_directory_uri(terminal);
+        if (uri && g_str_has_prefix(uri, "file://")) {
+            path = g_strdup(uri + 7);
+        }
+    }
+
+    if (path) {
+        const char *home = g_get_home_dir();
+        char short_path[512];
+        const char *display_path;
+        if (home && g_str_has_prefix(path, home)) {
+            snprintf(short_path, sizeof(short_path), "~%s", path + strlen(home));
+            display_path = short_path;
+        } else {
+            display_path = path;
+        }
+        snprintf(title_buf, sizeof(title_buf), "%s@%s:%s",
+                 username ? username : g_get_user_name(), g_get_host_name(), display_path);
+        g_free(path);
+    } else {
+        /* Fallback 2: VTE window title (may be stale but better than nothing) */
+        const char *vte_title = vte_terminal_get_window_title(terminal);
+        if (vte_title && strlen(vte_title) > 0) {
+            snprintf(title_buf, sizeof(title_buf), "%s", vte_title);
+        } else {
+            snprintf(title_buf, sizeof(title_buf), "%s@%s:~",
+                     username ? username : g_get_user_name(), g_get_host_name());
+        }
+    }
+
+    /* Clean up dynamically allocated username */
+    if (username) g_free(username);
+
+    /* Walk up widget tree to find notebook and page child */
+    GtkWidget *w = GTK_WIDGET(terminal);
+    GtkNotebook *notebook = NULL;
+    GtkWidget *page_child = NULL;
+
+    while (w) {
+        GtkWidget *parent = gtk_widget_get_parent(w);
+        if (parent && GTK_IS_NOTEBOOK(parent)) {
+            notebook = GTK_NOTEBOOK(parent);
+            page_child = w;
+            break;
+        }
+        w = parent;
+    }
+
+    if (!notebook || !page_child) return;
+
+    GtkWidget *tab_widget = gtk_notebook_get_tab_label(notebook, page_child);
+    if (!tab_widget) return;
+
+    GtkWidget *hbox = GTK_IS_EVENT_BOX(tab_widget) ? gtk_bin_get_child(GTK_BIN(tab_widget)) : tab_widget;
+    if (!hbox) return;
+
+    /* Skip update if user has custom-titled this tab */
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(hbox), "custom-title"))) return;
+
+    GtkWidget *label = GTK_WIDGET(g_object_get_data(G_OBJECT(hbox), "tab-label"));
+    if (label && GTK_IS_LABEL(label)) {
+        const char *cur_text = gtk_label_get_text(GTK_LABEL(label));
+        if (g_strcmp0(cur_text, title_buf) != 0) {
+            gtk_label_set_text(GTK_LABEL(label), title_buf);
+        }
+    }
+}
+
+static void on_terminal_title_changed(VteTerminal *terminal, gpointer user_data) {
+    (void)user_data;
+    update_vte_tab_title(terminal);
+}
+
+static void on_terminal_directory_changed(VteTerminal *terminal, gpointer user_data) {
+    (void)user_data;
+    update_vte_tab_title(terminal);
+}
+
+static gboolean terminal_poll_title_cb(gpointer user_data) {
+    VteTerminal *terminal = VTE_TERMINAL(user_data);
+    if (!GTK_IS_WIDGET(terminal)) return G_SOURCE_REMOVE;
+    update_vte_tab_title(terminal);
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_terminal_destroyed(GtkWidget *widget, gpointer user_data) {
+    guint poll_id = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(widget), "poll_id"));
+    if (poll_id != 0) {
+        g_source_remove(poll_id);
+    }
 }
 
 // Function to add a new terminal
@@ -350,9 +569,24 @@ void add_terminal(GtkNotebook *notebook) {
     gtk_container_add(GTK_CONTAINER(tab_container), term_widget->box);
     apply_settings(VTE_TERMINAL(term_widget->terminal));
 
+    /* Connect signals for dynamic user@host:path tab titles */
+    g_signal_connect(term_widget->terminal, "window-title-changed",
+                     G_CALLBACK(on_terminal_title_changed), NULL);
+    g_signal_connect(term_widget->terminal, "current-directory-uri-changed",
+                     G_CALLBACK(on_terminal_directory_changed), NULL);
+    g_signal_connect(term_widget->terminal, "destroy",
+                     G_CALLBACK(on_terminal_destroyed), NULL);
+
+    guint poll_id = g_timeout_add(1000, terminal_poll_title_cb, term_widget->terminal);
+    g_object_set_data(G_OBJECT(term_widget->terminal), "poll_id", GUINT_TO_POINTER(poll_id));
+
     int current_page = gtk_notebook_get_current_page(notebook);
     int new_page = (current_page >= 0) ? current_page + 1 : 0;
-    gtk_notebook_insert_page(notebook, tab_container, create_tab_label(notebook, "Terminal"), new_page);
+
+    char default_title[256];
+    snprintf(default_title, sizeof(default_title), "%s@%s:~", g_get_user_name(), g_get_host_name());
+
+    gtk_notebook_insert_page(notebook, tab_container, create_tab_label(notebook, default_title), new_page);
     gtk_notebook_set_current_page(notebook, new_page);
     gtk_widget_show_all(GTK_WIDGET(notebook));
 }

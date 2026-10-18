@@ -747,6 +747,35 @@ Escapes string for JSON.
 - `\n` → `\\n`
 - `\t` → `\\t`
 
+### Notes UI Module
+
+#### `void notes_init(GtkWidget *header_bar)`
+Initializes the Markdown Notes popover panel and UI controls, then adds the "Note" toggle button to the main header bar.
+
+**Parameters**:
+- `header_bar`: The GTK header bar container to pack the Note toggle button into.
+
+#### `void notes_refresh(void)`
+Triggers an auto-save of the active note, updates the notes list from the database, and refreshes the list in the dropdown combo box.
+
+#### `void notes_toggle(void)`
+Programmatically toggles the Notes editor popover panel open or closed.
+
+#### `void notes_toggle_pin(void)`
+Toggles the Notes editor pinned state. When active, it disables the modal grab, keeping the Notes panel visible while the user types in the terminal.
+
+#### `void notes_trigger_snip(void)`
+Triggers the interactive screen snip tool, mapping a translucent selection overlay window globally over the screen.
+
+#### `gboolean notes_handle_window_click(GdkEventButton *event)`
+Intercepts GDK mouse clicks entering the window. If Notes is unpinned and open, it pops down the Notes panel and allows the click to focus the target terminal in a single click.
+
+**Parameters**:
+- `event`: GdkEventButton pointer containing mouse click coordinates and target.
+
+#### `void close_notes_if_unpinned(void)`
+Pops down the Notes popover if it is visible and currently unpinned.
+
 ---
 
 ## Data Structures

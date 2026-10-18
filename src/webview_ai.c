@@ -858,11 +858,12 @@ void webview_append_message(GtkWidget *webview, const char *role, const char *co
     if (!webview || !content) return;
     
     char *html_content = markdown_to_html(content);
-    
+
     const char *role_label = strcmp(role, "user") == 0 ? "👤 You" : "🤖 AI";
     const char *role_class = strcmp(role, "user") == 0 ? "user" : "assistant";
-    
-    // Escape single quotes in HTML content for JavaScript string
+
+    /* SEC-002 FIX: Use textContent for role label and createElement approach to prevent XSS.
+     * Only markdown-converted content (already sanitized) goes into innerHTML. */
     GString *escaped = g_string_new("");
     for (const char *p = html_content; *p; p++) {
         if (*p == '\'') {
@@ -875,22 +876,42 @@ void webview_append_message(GtkWidget *webview, const char *role, const char *co
             g_string_append_c(escaped, *p);
         }
     }
-    
+
+    /* Escape role_label for safe insertion as textContent */
+    GString *escaped_role = g_string_new("");
+    for (const char *p = role_label; *p; p++) {
+        if (*p == '\'') {
+            g_string_append(escaped_role, "\\'");
+        } else if (*p == '\\') {
+            g_string_append(escaped_role, "\\\\");
+        } else {
+            g_string_append_c(escaped_role, *p);
+        }
+    }
+
     gchar *script = g_strdup_printf(
         "var div = document.createElement('div');"
         "div.className = 'message %s';"
-        "div.innerHTML = '<div class=\"role\">%s</div><div class=\"content\">%s</div>';"
+        "var roleDiv = document.createElement('div');"
+        "roleDiv.className = 'role';"
+        "roleDiv.textContent = '%s';"
+        "var contentDiv = document.createElement('div');"
+        "contentDiv.className = 'content';"
+        "contentDiv.innerHTML = '%s';"
+        "div.appendChild(roleDiv);"
+        "div.appendChild(contentDiv);"
         "document.getElementById('content').appendChild(div);"
         "var nodes = div.querySelectorAll('.mermaid');"
         "if (nodes.length > 0) {"
         "  mermaid.run({ nodes: nodes }).catch(function(err) { console.error('Mermaid Error:', JSON.stringify(err)); });"
         "}"
         "window.scrollTo(0, document.body.scrollHeight);",
-        role_class, role_label, escaped->str
+        role_class, escaped_role->str, escaped->str
     );
-    
+
     webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(webview), script, -1, NULL, NULL, NULL, NULL, NULL);
-    
+
+    g_string_free(escaped_role, TRUE);
     g_string_free(escaped, TRUE);
     g_free(html_content);
     g_free(script);
@@ -898,17 +919,24 @@ void webview_append_message(GtkWidget *webview, const char *role, const char *co
 
 void webview_start_ai_message(GtkWidget *webview) {
     if (!webview) return;
-    
-    const char *script = 
+
+    /* SEC-002 FIX: Use createElement and textContent for role label */
+    const char *script =
         "var old = document.getElementById('current-ai-response');"
         "if (old) old.removeAttribute('id');"
         "var div = document.createElement('div');"
         "div.className = 'message assistant';"
         "div.id = 'current-ai-response';"
-        "div.innerHTML = '<div class=\"role\">🤖 AI</div><div class=\"content\"></div>';"
+        "var roleDiv = document.createElement('div');"
+        "roleDiv.className = 'role';"
+        "roleDiv.textContent = '🤖 AI';"
+        "var contentDiv = document.createElement('div');"
+        "contentDiv.className = 'content';"
+        "div.appendChild(roleDiv);"
+        "div.appendChild(contentDiv);"
         "document.getElementById('content').appendChild(div);"
         "window.scrollTo(0, document.body.scrollHeight);";
-        
+
     webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(webview), script, -1, NULL, NULL, NULL, NULL, NULL);
 }
 

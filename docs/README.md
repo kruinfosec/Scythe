@@ -7,6 +7,7 @@ A modern GTK+3 terminal emulator with integrated AI assistance, built for develo
 - **Multi-tab Terminal Emulation**: VTE-based terminal with split-screen support
 - **Integrated AI Assistant**: Powered by Groq Cloud API with streaming responses
 - **Rich Markdown Rendering**: WebView-based chat interface with syntax highlighting and Mermaid.js diagrams
+- **Interactive Markdown Notes**: Side-by-side notes panel with formatting shortcuts, dynamic syntax auto-hiding, system-wide snip capture (`Ctrl+Alt+S`), and portable Markdown/PDF exporting
 - **Session Logging**: SQLite-backed command history and session replay
 - **Script Automation**: Discover and execute bash scripts from menu
 - **Full Customization**: Themes, colors, fonts, opacity, keyboard shortcuts
@@ -92,6 +93,10 @@ Comprehensive documentation available in [`docs/`](docs/):
 | Split Vertical | `Ctrl+Shift+R` |
 | Toggle AI Panel | `Ctrl+Shift+A` |
 | Open Settings | `Ctrl+Shift+P` |
+| Toggle Notes Panel | `Alt+N` |
+| Toggle Notes Pin | `Alt+P` |
+| Snip Tool (Capture) | `Ctrl+Alt+S` |
+| Close Popover (unpinned)| `Escape` |
 
 All shortcuts configurable via Settings dialog.
 

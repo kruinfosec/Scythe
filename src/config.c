@@ -291,6 +291,34 @@ void apply_ui_theme() {
         "#dama-toggle-button {"
         "   background-color: %s;"
         "   color: %s;"
+        "}"
+        "#pin-toggle-button {"
+        "   background-color: %s;"
+        "   color: %s;"
+        "}"
+        "#pin-toggle-button:checked, #pin-toggle-button.pin-active, "
+        "button#pin-toggle-button:checked, button#pin-toggle-button.pin-active {"
+        "   background: #e63946;"
+        "   background-color: #e63946;"
+        "   background-image: none;"
+        "   color: #ffffff;"
+        "   border: 1px solid #d62828;"
+        "   border-color: #d62828;"
+        "   box-shadow: none;"
+        "}"
+        "#pin-toggle-button:checked:hover, #pin-toggle-button.pin-active:hover, "
+        "button#pin-toggle-button:checked:hover, button#pin-toggle-button.pin-active:hover {"
+        "   background: #d62828;"
+        "   background-color: #d62828;"
+        "   background-image: none;"
+        "   color: #ffffff;"
+        "   border: 1px solid #b71c1c;"
+        "   border-color: #b71c1c;"
+        "   box-shadow: none;"
+        "}"
+        "#pin-toggle-button:checked label, #pin-toggle-button.pin-active label, "
+        "#pin-toggle-button:checked *, #pin-toggle-button.pin-active * {"
+        "   color: #ffffff;"
         "}",
         ui_fg,                  // Window (FG used)
         ui_bg, ui_fg,           // Dialogs/popovers/menus
@@ -309,7 +337,8 @@ void apply_ui_theme() {
         ai_bg, ui_fg,           // AI Panel & Response View
         ui_bg,                  // Scrollbar color
         btn_bg, btn_fg,         // Logging toggle button standard
-        btn_bg, btn_fg          // Dama toggle button standard
+        btn_bg, btn_fg,         // Dama toggle button standard
+        btn_bg, btn_fg          // Pin toggle button standard
     );
 
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
@@ -363,7 +392,8 @@ void save_settings() {
     char *config_path = g_build_filename(config_dir, "Scythe", NULL);
     char *settings_file = g_build_filename(config_path, "settings.json", NULL);
 
-    g_mkdir_with_parents(config_path, 0755);
+    /* SEC-003 MITIGATION: Ensure config directory has restricted permissions */
+    g_mkdir_with_parents(config_path, 0700);
 
     JsonBuilder *builder = json_builder_new();
     json_builder_begin_object(builder);
@@ -556,6 +586,9 @@ void save_settings() {
     char *json = json_generator_to_data(gen, NULL);
     g_file_set_contents(settings_file, json, -1, NULL);
     g_free(json);
+
+    /* SEC-003 MITIGATION: Set restrictive permissions (0600) on settings file containing API key */
+    chmod(settings_file, 0600);
 
     g_object_unref(gen);
     g_object_unref(builder);
@@ -1679,6 +1712,39 @@ void open_customise_dialog(GtkWidget *widget, gpointer user_data) {
     }
     g_signal_connect(model_combo, "changed", G_CALLBACK(on_groq_model_changed), NULL);
     gtk_box_pack_start(GTK_BOX(ai_box), model_combo, FALSE, FALSE, 5);
+
+    // --- About Page ---
+    GtkWidget *about_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(about_box), 15);
+
+    GtkWidget *about_title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(about_title), "<span size='x-large' weight='bold'>Scythe</span>");
+    gtk_widget_set_halign(about_title, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(about_box), about_title, FALSE, FALSE, 0);
+
+    GtkWidget *version_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(version_label), "<b>Version:</b> " SCYTHE_VERSION);
+    gtk_widget_set_halign(version_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(about_box), version_label, FALSE, FALSE, 0);
+
+    GtkWidget *dev_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(dev_label), "<b>Developed by:</b> " SCYTHE_DEVELOPER);
+    gtk_widget_set_halign(dev_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(about_box), dev_label, FALSE, FALSE, 0);
+
+    GtkWidget *about_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(about_box), about_sep, FALSE, FALSE, 5);
+
+    GtkWidget *note_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(note_label),
+        "<i>Proprietary Notice:</i>\n\n"
+        "Scythe is an advanced CyberSecurity Workbench designed for multitasking security analysts, penetration testers, and researchers.\n\n"
+        "This product is designed, engineered, and developed exclusively by <b>KruInfosec</b>. All rights reserved.");
+    gtk_label_set_line_wrap(GTK_LABEL(note_label), TRUE);
+    gtk_widget_set_halign(note_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(about_box), note_label, FALSE, FALSE, 0);
+
+    gtk_stack_add_titled(GTK_STACK(stack), about_box, "about", "About");
 
     gtk_widget_show_all(dialog);
     

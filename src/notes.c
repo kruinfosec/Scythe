@@ -13,6 +13,7 @@ static GtkWidget *notes_textview = NULL;
 static GtkWidget *notes_combo = NULL;
 static GtkWidget *g_note_toggle_btn = NULL;
 static GtkWidget *g_pin_toggle_btn = NULL;
+static GtkCssProvider *g_pin_css_provider = NULL;
 static GtkWidget *status_label = NULL;
 static GtkWidget *find_replace_bar = NULL;
 static GtkWidget *search_entry = NULL;
@@ -23,6 +24,16 @@ static guint status_clear_timer_id = 0;
 static gboolean is_notes_pinned = FALSE;
 /* Tracks currently active image widget for toolbar show/hide */
 static gpointer active_image_data_ptr = NULL;
+
+/* Custom clipboard for copying images within notes */
+typedef struct {
+    char *filename;
+    int width;
+    char *alignment;
+    gboolean has_image;
+} ImageClipboard;
+
+static ImageClipboard image_clipboard = {NULL, 450, NULL, FALSE};
 
 typedef struct {
     GtkWidget *container;
@@ -39,6 +50,7 @@ typedef struct {
 } ImageWidgetData;
 
 // ---- Storage Dir Helper ----
+// Returns base image directory (shared cache). Always call g_mkdir_with_parents lazily.
 static const char* get_note_images_dir(void) {
     static char img_dir[512] = {0};
     if (img_dir[0] == '\0') {
@@ -47,6 +59,17 @@ static const char* get_note_images_dir(void) {
         g_mkdir_with_parents(img_dir, 0755);
     }
     return img_dir;
+}
+
+// Returns namespaced image dir for a specific note (RC-6 fix).
+// Caller must NOT free the returned string (static buffer per-call via g_build_filename).
+// Note: returns heap string — caller must g_free.
+static G_GNUC_UNUSED char* get_note_image_dir_for(int note_id) {
+    const char *base = get_note_images_dir();
+    if (note_id <= 0) return g_strdup(base);
+    char *dir = g_strdup_printf("%s/note_%d", base, note_id);
+    g_mkdir_with_parents(dir, 0755);
+    return dir;
 }
 
 static char* sanitize_filename(const char *input) {
@@ -68,8 +91,15 @@ static char* sanitize_filename(const char *input) {
 static GPtrArray *undo_stack = NULL;
 static GPtrArray *redo_stack = NULL;
 static gboolean in_undo_redo = FALSE;
+static guint undo_timer_id = 0;
+static gboolean user_initiated_change = TRUE;  /* FUNC-001 FIX: Track user vs automatic changes */
+static void on_buffer_changed_render(GtkTextBuffer *buffer, gpointer user_data);
 
 static void clear_undo_redo_stacks(void) {
+    if (undo_timer_id != 0) {
+        g_source_remove(undo_timer_id);
+        undo_timer_id = 0;
+    }
     if (undo_stack) {
         g_ptr_array_free(undo_stack, TRUE);
         undo_stack = NULL;
@@ -84,6 +114,12 @@ static void clear_undo_redo_stacks(void) {
 
 static void push_undo_state(const char *text) {
     if (in_undo_redo || !text) return;
+
+    if (undo_timer_id != 0) {
+        g_source_remove(undo_timer_id);
+        undo_timer_id = 0;
+    }
+
     if (!undo_stack) undo_stack = g_ptr_array_new_with_free_func(g_free);
 
     // Don't push duplicate states
@@ -103,6 +139,67 @@ static void push_undo_state(const char *text) {
     }
 }
 
+// --- RC-4 fix: capture_clean_undo_state ---
+// Captures buffer text INCLUDING hidden chars (so <img> tags and markdown syntax
+// are preserved), then strips U+FFFC Object Replacement Characters (inserted by
+// GtkTextChildAnchors). This produces clean, replayable markdown for the undo stack.
+static char* capture_clean_undo_state(GtkTextBuffer *buffer) {
+    if (!buffer) return NULL;
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(buffer, &s, &e);
+    // include_hidden_chars=TRUE so hidden <img> tag lines and md syntax are captured
+    char *raw = gtk_text_buffer_get_text(buffer, &s, &e, TRUE);
+    if (!raw) return g_strdup("");
+
+    // Strip U+FFFC (0xEF 0xBF 0xBC in UTF-8) - inserted by child anchors (RC-1)
+    GString *clean = g_string_sized_new(strlen(raw));
+    const char *p = raw;
+    while (*p) {
+        // g_utf8_get_char is safe for any valid UTF-8 sequence
+        gunichar ch = g_utf8_get_char(p);
+        if (ch == 0xFFFCu) {
+            // Skip ORC — do not include in undo snapshot
+        } else {
+            g_string_append_unichar(clean, ch);
+        }
+        p = g_utf8_next_char(p);
+    }
+    g_free(raw);
+    return g_string_free(clean, FALSE);
+}
+
+// --- RC-8 fix: ref-counted buffer in timer callback ---
+static gboolean undo_timer_cb(gpointer user_data) {
+    undo_timer_id = 0;
+    // user_data is a ref-counted GtkTextBuffer — validate before use
+    if (user_data && GTK_IS_TEXT_BUFFER(user_data) && notes_textview && !in_undo_redo) {
+        GtkTextBuffer *buffer = GTK_TEXT_BUFFER(user_data);
+        char *text = capture_clean_undo_state(buffer);
+        if (text) {
+            push_undo_state(text);
+            g_free(text);
+        }
+    }
+    // Unref the buffer we ref'd in schedule_undo_push (RC-8)
+    if (user_data && GTK_IS_TEXT_BUFFER(user_data)) {
+        g_object_unref(GTK_TEXT_BUFFER(user_data));
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_undo_push(GtkTextBuffer *buffer) {
+    /* FUNC-001 FIX: Only push undo states for user-initiated changes.
+     * Automatic changes (markdown tag application, anchor creation) don't pollute undo stack. */
+    if (in_undo_redo || !buffer || !user_initiated_change) return;
+    if (undo_timer_id != 0) {
+        // Unref the previously ref'd buffer for the cancelled timer
+        g_source_remove(undo_timer_id);
+        undo_timer_id = 0;
+    }
+    // RC-8: ref the buffer so it stays alive until timer fires
+    undo_timer_id = g_timeout_add(500, undo_timer_cb, g_object_ref(buffer));
+}
+
 // Forward declarations
 static void on_note_selected(GtkComboBox *combo, gpointer user_data);
 static void on_note_toggled(GtkToggleButton *button, gpointer user_data);
@@ -110,8 +207,13 @@ static void on_popover_closed(GtkPopover *popover, gpointer user_data);
 static void on_new_note_clicked(GtkButton *button, gpointer user_data);
 static void on_timestamp_clicked(GtkButton *button, gpointer user_data);
 static void apply_markdown_tags(GtkTextBuffer *buffer);
+static void cancel_pending_render(void);
+static void parse_and_render_images_in_buffer(GtkTextBuffer *buffer);
 static void save_current_note(void);
 static void show_status_message(const char *msg, gboolean is_error);
+static void refresh_notes_list(void);
+static void show_rename_note_dialog(void);
+static void delete_current_note(void);
 
 // ---- Markdown Tag Definitions ----
 static int current_edit_line = -1;
@@ -180,10 +282,20 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
     if (!gtk_text_iter_ends_line(&line_end))
         gtk_text_iter_forward_to_line_end(&line_end);
 
-    char *text = gtk_text_buffer_get_text(buffer, &line_start, &line_end, FALSE);
+    /* RC-1/RC-7 FIX: Always use include_hidden_chars=TRUE here (rendering pass).
+     * This ensures the returned string matches the exact character count of the buffer,
+     * including hidden child anchors (U+FFFC), so CHAR_OFF offsets match buffer iterators. */
+    char *text = gtk_text_buffer_get_text(buffer, &line_start, &line_end, TRUE);
     if (!text) return;
 
     int len = strlen(text);
+    /* char_len counts actual Unicode code points for iterator advancement */
+    glong char_len = g_utf8_strlen(text, -1);
+    (void)char_len; /* used implicitly via g_utf8_pointer_to_offset below */
+
+    /* Helper macro: advance an iter from line_start by the character offset of ptr within text.
+     * This is safe for all UTF-8 content including U+FFFC object replacement chars. */
+#define CHAR_OFF(ptr) ((gint)g_utf8_pointer_to_offset(text, (ptr)))
 
     if (g_str_has_prefix(text, "### ")) {
         GtkTextIter content_start = line_start;
@@ -233,8 +345,9 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
             if (txt_end[1] != '(') { lp = txt_end + 1; continue; }
             const char *url_end = strchr(txt_end + 2, ')');
             if (!url_end) break;
-            int lts = (int)(lp + 1 - text);
-            int lte = (int)(txt_end - text);
+            /* RC-1/RC-7: use CHAR_OFF() not byte pointer arithmetic */
+            gint lts = CHAR_OFF(lp + 1);
+            gint lte = CHAR_OFF(txt_end);
             if (lte > lts && url_end > txt_end + 2) {
                 GtkTextIter ls2 = line_start, le2 = line_start;
                 gtk_text_iter_forward_chars(&ls2, lts);
@@ -242,19 +355,54 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-link", &ls2, &le2);
                 /* Hide [ ... ]( url ) syntax markers */
                 GtkTextIter syn1s = line_start, syn1e = line_start;
-                gtk_text_iter_forward_chars(&syn1s, (int)(lp - text));
+                gtk_text_iter_forward_chars(&syn1s, CHAR_OFF(lp));
                 gtk_text_iter_forward_chars(&syn1e, lts);
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &syn1s, &syn1e);
                 GtkTextIter syn2s = line_start, syn2e = line_start;
                 gtk_text_iter_forward_chars(&syn2s, lte);
-                gtk_text_iter_forward_chars(&syn2e, (int)(url_end + 1 - text));
+                gtk_text_iter_forward_chars(&syn2e, CHAR_OFF(url_end + 1));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &syn2s, &syn2e);
             }
             lp = url_end + 1;
         }
+
+        /* Also tag bare URLs (http:// or https://) if not inside [text](url) */
+        const char *hp = text;
+        while (hp && *hp) {
+            const char *http_pos = strstr(hp, "http://");
+            const char *https_pos = strstr(hp, "https://");
+            const char *url_start = NULL;
+            if (http_pos && https_pos) url_start = (http_pos < https_pos) ? http_pos : https_pos;
+            else if (http_pos) url_start = http_pos;
+            else if (https_pos) url_start = https_pos;
+            if (!url_start) break;
+
+            if (url_start > text && *(url_start - 1) == '(') {
+                hp = url_start + 7;
+                continue;
+            }
+
+            const char *url_end = url_start;
+            while (*url_end && *url_end != ' ' && *url_end != '\t' && *url_end != '\n' &&
+                   *url_end != ')' && *url_end != ']' && *url_end != '"' && *url_end != '>') {
+                url_end++;
+            }
+
+            gint us = CHAR_OFF(url_start);
+            gint ue = CHAR_OFF(url_end);
+            if (ue > us) {
+                GtkTextIter u_s = line_start, u_e = line_start;
+                gtk_text_iter_forward_chars(&u_s, us);
+                gtk_text_iter_forward_chars(&u_e, ue);
+                gtk_text_buffer_apply_tag_by_name(buffer, "md-link", &u_s, &u_e);
+            }
+            hp = url_end;
+        }
     }
 
-    // Inline formatting
+    /* Inline formatting: walk text byte-by-byte (ASCII-only delimiters: *, `, ~)
+     * Use CHAR_OFF() when computing iterator positions from pointer differences.
+     * 'offset' here is a BYTE offset used only for ASCII delimiter scanning. */
     const char *p = text;
     int offset = 0;
     while (offset < len) {
@@ -270,16 +418,16 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
             if (end_off > 0) {
                 GtkTextIter s = line_start, e = line_start;
                 GtkTextIter ss = line_start, se = line_start;
-                gtk_text_iter_forward_chars(&s, start_off + 2);
-                gtk_text_iter_forward_chars(&e, end_off - 2);
+                gtk_text_iter_forward_chars(&s, CHAR_OFF(p + start_off + 2));
+                gtk_text_iter_forward_chars(&e, CHAR_OFF(p + end_off - 2));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-bold", &s, &e);
-                gtk_text_iter_forward_chars(&ss, start_off);
+                gtk_text_iter_forward_chars(&ss, CHAR_OFF(p + start_off));
                 GtkTextIter ss2 = line_start;
-                gtk_text_iter_forward_chars(&ss2, start_off + 2);
+                gtk_text_iter_forward_chars(&ss2, CHAR_OFF(p + start_off + 2));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &ss, &ss2);
-                gtk_text_iter_forward_chars(&se, end_off - 2);
+                gtk_text_iter_forward_chars(&se, CHAR_OFF(p + end_off - 2));
                 GtkTextIter se2 = line_start;
-                gtk_text_iter_forward_chars(&se2, end_off);
+                gtk_text_iter_forward_chars(&se2, CHAR_OFF(p + end_off));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &se, &se2);
                 offset = end_off;
                 continue;
@@ -296,16 +444,16 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
             }
             if (end_off > 0) {
                 GtkTextIter s = line_start, e = line_start;
-                gtk_text_iter_forward_chars(&s, start_off + 1);
-                gtk_text_iter_forward_chars(&e, end_off - 1);
+                gtk_text_iter_forward_chars(&s, CHAR_OFF(p + start_off + 1));
+                gtk_text_iter_forward_chars(&e, CHAR_OFF(p + end_off - 1));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-italic", &s, &e);
                 GtkTextIter ss = line_start, ss2 = line_start;
-                gtk_text_iter_forward_chars(&ss, start_off);
-                gtk_text_iter_forward_chars(&ss2, start_off + 1);
+                gtk_text_iter_forward_chars(&ss, CHAR_OFF(p + start_off));
+                gtk_text_iter_forward_chars(&ss2, CHAR_OFF(p + start_off + 1));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &ss, &ss2);
                 GtkTextIter se = line_start, se2 = line_start;
-                gtk_text_iter_forward_chars(&se, end_off - 1);
-                gtk_text_iter_forward_chars(&se2, end_off);
+                gtk_text_iter_forward_chars(&se, CHAR_OFF(p + end_off - 1));
+                gtk_text_iter_forward_chars(&se2, CHAR_OFF(p + end_off));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &se, &se2);
                 offset = end_off;
                 continue;
@@ -322,17 +470,17 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
             }
             if (end_off > 0) {
                 GtkTextIter s = line_start, e = line_start;
-                gtk_text_iter_forward_chars(&s, start_off + 3);
-                gtk_text_iter_forward_chars(&e, end_off - 4);
+                gtk_text_iter_forward_chars(&s, CHAR_OFF(p + start_off + 3));
+                gtk_text_iter_forward_chars(&e, CHAR_OFF(p + end_off - 4));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-underline", &s, &e);
                 /* Hide <u> and </u> syntax */
                 GtkTextIter ss = line_start, ss2 = line_start;
-                gtk_text_iter_forward_chars(&ss, start_off);
-                gtk_text_iter_forward_chars(&ss2, start_off + 3);
+                gtk_text_iter_forward_chars(&ss, CHAR_OFF(p + start_off));
+                gtk_text_iter_forward_chars(&ss2, CHAR_OFF(p + start_off + 3));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &ss, &ss2);
                 GtkTextIter se = line_start, se2 = line_start;
-                gtk_text_iter_forward_chars(&se, end_off - 4);
-                gtk_text_iter_forward_chars(&se2, end_off);
+                gtk_text_iter_forward_chars(&se, CHAR_OFF(p + end_off - 4));
+                gtk_text_iter_forward_chars(&se2, CHAR_OFF(p + end_off));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &se, &se2);
                 offset = end_off;
                 continue;
@@ -349,8 +497,8 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
             }
             if (end_off > 0) {
                 GtkTextIter s = line_start, e = line_start;
-                gtk_text_iter_forward_chars(&s, start_off);
-                gtk_text_iter_forward_chars(&e, end_off);
+                gtk_text_iter_forward_chars(&s, CHAR_OFF(p + start_off));
+                gtk_text_iter_forward_chars(&e, CHAR_OFF(p + end_off));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-code", &s, &e);
                 offset = end_off;
                 continue;
@@ -367,17 +515,17 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
             }
             if (end_off > 0) {
                 GtkTextIter s = line_start, e = line_start;
-                gtk_text_iter_forward_chars(&s, start_off + 2);
-                gtk_text_iter_forward_chars(&e, end_off - 2);
+                gtk_text_iter_forward_chars(&s, CHAR_OFF(p + start_off + 2));
+                gtk_text_iter_forward_chars(&e, CHAR_OFF(p + end_off - 2));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-strikethrough", &s, &e);
                 /* Hide ~~ syntax */
                 GtkTextIter ss = line_start, ss2 = line_start;
-                gtk_text_iter_forward_chars(&ss, start_off);
-                gtk_text_iter_forward_chars(&ss2, start_off + 2);
+                gtk_text_iter_forward_chars(&ss, CHAR_OFF(p + start_off));
+                gtk_text_iter_forward_chars(&ss2, CHAR_OFF(p + start_off + 2));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &ss, &ss2);
                 GtkTextIter se = line_start, se2 = line_start;
-                gtk_text_iter_forward_chars(&se, end_off - 2);
-                gtk_text_iter_forward_chars(&se2, end_off);
+                gtk_text_iter_forward_chars(&se, CHAR_OFF(p + end_off - 2));
+                gtk_text_iter_forward_chars(&se2, CHAR_OFF(p + end_off));
                 gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &se, &se2);
                 offset = end_off;
                 continue;
@@ -386,6 +534,7 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
         offset++;
     }
 
+#undef CHAR_OFF
     g_free(text);
 }
 
@@ -393,6 +542,9 @@ static void render_line_tags(GtkTextBuffer *buffer, int line_num) {
 static void apply_markdown_tags(GtkTextBuffer *buffer) {
     if (!buffer) return;
     ensure_tags(buffer);
+
+    /* FUNC-001 FIX: Mark this as an automatic change to prevent undo stack pollution */
+    user_initiated_change = FALSE;
 
     GtkTextIter buf_start, buf_end;
     gtk_text_buffer_get_bounds(buffer, &buf_start, &buf_end);
@@ -466,7 +618,15 @@ static void apply_markdown_tags(GtkTextBuffer *buffer) {
                     gtk_text_buffer_apply_tag_by_name(buffer, "md-timestamp", &ls, &le);
                 }
             } else {
-                gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &ls, &le);
+                if (is_img_line) {
+                    GtkTextIter tag_start = ls;
+                    while (gtk_text_iter_get_child_anchor(&tag_start) && gtk_text_iter_compare(&tag_start, &le) < 0) {
+                        gtk_text_iter_forward_char(&tag_start);
+                    }
+                    gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &tag_start, &le);
+                } else {
+                    gtk_text_buffer_apply_tag_by_name(buffer, "md-syntax-hidden", &ls, &le);
+                }
             }
             g_free(line_text);
             continue;
@@ -478,26 +638,77 @@ static void apply_markdown_tags(GtkTextBuffer *buffer) {
 
         render_line_tags(buffer, i);
     }
+
+    /* FUNC-001 FIX: Reset flag so subsequent user changes are tracked */
+    user_initiated_change = TRUE;
+}
+
+static GtkTextBuffer *pending_render_buffer = NULL;
+static guint render_debounce_timer_id = 0;
+
+static void cancel_pending_render(void) {
+    if (render_idle_id != 0) {
+        g_source_remove(render_idle_id);
+        render_idle_id = 0;
+    }
+    if (render_debounce_timer_id != 0) {
+        g_source_remove(render_debounce_timer_id);
+        render_debounce_timer_id = 0;
+    }
+    if (pending_render_buffer) {
+        g_object_unref(pending_render_buffer);
+        pending_render_buffer = NULL;
+    }
 }
 
 static gboolean render_idle_cb(gpointer user_data) {
+    (void)user_data;
     render_idle_id = 0;
-    if (user_data) {
-        GtkTextBuffer *buffer = GTK_TEXT_BUFFER(user_data);
+    if (pending_render_buffer && GTK_IS_TEXT_BUFFER(pending_render_buffer)) {
+        GtkTextBuffer *buffer = pending_render_buffer;
+        pending_render_buffer = NULL;
+        /* RC-2 fix: render images first (creates child anchors safely in idle context),
+         * then apply markdown tags. Both operations have valid iterators here because
+         * no signals are blocked and the buffer is stable. */
+        parse_and_render_images_in_buffer(buffer);
         apply_markdown_tags(buffer);
-        g_object_unref(buffer); /* release strong ref taken in schedule_render */
+        g_object_unref(buffer);
+    } else if (pending_render_buffer) {
+        g_object_unref(pending_render_buffer);
+        pending_render_buffer = NULL;
     }
+    return G_SOURCE_REMOVE;
+}
+
+/* PERF-003 FIX: Debounced render callback - only render after 200ms of typing inactivity */
+static gboolean render_debounce_cb(gpointer user_data) {
+    render_debounce_timer_id = 0;
+    GtkTextBuffer *buffer = GTK_TEXT_BUFFER(user_data);
+    if (GTK_IS_TEXT_BUFFER(buffer)) {
+        pending_render_buffer = g_object_ref(buffer);
+        render_idle_id = g_idle_add(render_idle_cb, NULL);
+    }
+    g_object_unref(buffer);
     return G_SOURCE_REMOVE;
 }
 
 static void schedule_render(GtkTextBuffer *buffer) {
     if (!buffer) return;
+
+    /* PERF-003 FIX: Cancel existing debounce timer to restart countdown.
+     * This ensures rendering only happens 200ms after the last keystroke. */
+    if (render_debounce_timer_id != 0) {
+        g_source_remove(render_debounce_timer_id);
+    }
+
+    /* Cancel any pending idle render that hasn't started yet */
     if (render_idle_id != 0) {
         g_source_remove(render_idle_id);
         render_idle_id = 0;
     }
-    g_object_ref(buffer); /* keep buffer alive until idle fires */
-    render_idle_id = g_idle_add(render_idle_cb, buffer);
+
+    /* Start new debounce timer: render will execute after 200ms of inactivity */
+    render_debounce_timer_id = g_timeout_add(200, render_debounce_cb, g_object_ref(buffer));
 }
 
 // Status feedback helper
@@ -546,79 +757,6 @@ static GdkPixbuf* scale_pixbuf_responsive(GdkPixbuf *pixbuf, int max_width) {
 
 // ---- Interactive Resizable Image Widget with Drag Handle & Alignment Toolbar ----
 
-static void update_image_tag_in_markdown(const char *filename, int new_width, const char *alignment) {
-    if (!notes_textview || !filename) return;
-    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
-    if (!buffer) return;
-
-    const char *align_str = alignment ? alignment : "center";
-    int valid_w = (new_width >= 80 && new_width <= 800) ? new_width : 450;
-
-    char clean_fn[128];
-    g_strlcpy(clean_fn, filename, sizeof(clean_fn));
-    char *hash = strchr(clean_fn, '#');
-    if (hash) *hash = '\0';
-
-    /* Build the new tag string */
-    char new_img_tag[384];
-    snprintf(new_img_tag, sizeof(new_img_tag),
-             "<img src=\"scythe://note_image/%s\" width=\"%d\" align=\"%s\" />",
-             clean_fn, valid_w, align_str);
-
-    /* Build the search key — search for <img ... src="scythe://note_image/FILENAME" */
-    char search_key[256];
-    snprintf(search_key, sizeof(search_key), "scythe://note_image/%s", clean_fn);
-
-    /* Use iterator-based search to avoid offset mismatch caused by child anchors */
-    GtkTextIter search_start;
-    gtk_text_buffer_get_start_iter(buffer, &search_start);
-
-    GtkTextIter match_start, match_end;
-    if (!gtk_text_iter_forward_search(&search_start, search_key,
-                                      GTK_TEXT_SEARCH_TEXT_ONLY,
-                                      &match_start, &match_end, NULL)) {
-        save_current_note();
-        return; /* filename not found in buffer */
-    }
-
-    /* Walk backward from match_start to find the opening '<' of the tag */
-    GtkTextIter tag_open = match_start;
-    while (!gtk_text_iter_is_start(&tag_open)) {
-        gtk_text_iter_backward_char(&tag_open);
-        gunichar ch = gtk_text_iter_get_char(&tag_open);
-        if (ch == '<') break;
-        if (ch == '\n') {
-            /* Overshot — no opening '<' found on this line; abort to avoid corruption */
-            save_current_note();
-            return;
-        }
-    }
-
-    /* Walk forward from match_end to find the closing '>' */
-    GtkTextIter tag_close = match_end;
-    while (!gtk_text_iter_is_end(&tag_close)) {
-        gunichar ch = gtk_text_iter_get_char(&tag_close);
-        gtk_text_iter_forward_char(&tag_close);
-        if (ch == '>') break;
-        if (ch == '\n') {
-            save_current_note();
-            return;
-        }
-    }
-
-    /* Safety: ensure tag_open < tag_close and both are valid */
-    if (gtk_text_iter_compare(&tag_open, &tag_close) >= 0) {
-        save_current_note();
-        return;
-    }
-
-    /* Replace the old tag text with the new one */
-    gtk_text_buffer_delete(buffer, &tag_open, &tag_close);
-    gtk_text_buffer_insert(buffer, &tag_open, new_img_tag, -1);
-
-    save_current_note();
-}
-
 static void apply_image_alignment(ImageWidgetData *data) {
     if (!data || !data->container) return;
 
@@ -640,13 +778,14 @@ static void apply_image_alignment(ImageWidgetData *data) {
 static void save_image_metadata_canonical(ImageWidgetData *data) {
     if (!data || !data->filename) return;
 
-    // 1. SQLite is Canonical Source of Truth
+    /* RC-10 fix: ONLY save to SQLite on interactive resize/align.
+     * Do NOT modify buffer text here — that causes anchor destruction and duplication.
+     * The buffer's <img> tag remains at its initial state during editing.
+     * The tag will be updated when the note is saved (save_current_note),
+     * ensuring the markdown is portable but preventing duplication during interaction. */
     if (current_note_id != -1) {
         note_update_image_metadata(current_note_id, data->filename, data->current_width, data->alignment);
     }
-
-    // 2. Portable Fallback in Markdown
-    update_image_tag_in_markdown(data->filename, data->current_width, data->alignment);
 }
 
 // Drag-to-Resize Handlers
@@ -789,6 +928,7 @@ static gboolean on_image_area_clicked(GtkWidget *widget, GdkEventButton *event, 
     }
     if (data->toolbar) gtk_widget_show(data->toolbar);
     if (data->handle_eventbox) gtk_widget_show(data->handle_eventbox);
+    if (notes_textview) gtk_widget_grab_focus(notes_textview);
     return FALSE; /* don't consume event so drag handle still works */
 }
 
@@ -894,25 +1034,22 @@ static void insert_image_into_buffer(GdkPixbuf *pixbuf, const char *filename, co
     GtkTextIter iter;
     gtk_text_buffer_get_iter_at_mark(buffer, &iter, mark);
 
-    gtk_text_buffer_insert(buffer, &iter, "\n", -1);
-
-    GtkTextChildAnchor *anchor = gtk_text_buffer_create_child_anchor(buffer, &iter);
-    GtkWidget *img_widget = create_resizable_image_widget(pixbuf, filename, 450, "center");
-    if (img_widget && anchor) {
-        gtk_text_view_add_child_at_anchor(GTK_TEXT_VIEW(notes_textview), img_widget, anchor);
-    }
-
+    /* Phase 8 fix: Do not create a child anchor here.
+     * Inserting the text alone will trigger on_buffer_changed_render,
+     * which schedules parse_and_render_images_in_buffer in the idle loop.
+     * That function will cleanly find the tag and create the anchor.
+     * Creating it here caused a double-anchor bug and iterator invalidation crashes. */
     char *img_tag = g_strdup_printf("\n<img src=\"scythe://note_image/%s\" width=\"450\" align=\"center\" />\nCaptured: %s\n",
                                     filename ? filename : "snip.png",
                                     timestamp_str ? timestamp_str : "");
     gtk_text_buffer_insert(buffer, &iter, img_tag, -1);
     g_free(img_tag);
 
-    GtkTextIter s, e;
-    gtk_text_buffer_get_bounds(buffer, &s, &e);
-    char *full_text = gtk_text_buffer_get_text(buffer, &s, &e, FALSE);
-    push_undo_state(full_text);
-    g_free(full_text);
+    char *clean_snap = capture_clean_undo_state(buffer);
+    if (clean_snap) {
+        push_undo_state(clean_snap);
+        g_free(clean_snap);
+    }
 }
 
 // ---- Formatting Helpers ----
@@ -1011,11 +1148,12 @@ do_wrap:
     }
 
 push_undo: ;
-    GtkTextIter s, e;
-    gtk_text_buffer_get_bounds(buffer, &s, &e);
-    char *text = gtk_text_buffer_get_text(buffer, &s, &e, FALSE);
-    push_undo_state(text);
-    g_free(text);
+    /* BUG #5 FIX: Use capture_clean_undo_state() to preserve hidden content in undo stack */
+    char *text = capture_clean_undo_state(buffer);
+    if (text) {
+        push_undo_state(text);
+        g_free(text);
+    }
 }
 
 static void insert_line_prefix(const char *prefix) {
@@ -1032,11 +1170,12 @@ static void insert_line_prefix(const char *prefix) {
 
     gtk_text_buffer_insert(buffer, &line_start, prefix, -1);
 
-    GtkTextIter s, e;
-    gtk_text_buffer_get_bounds(buffer, &s, &e);
-    char *text = gtk_text_buffer_get_text(buffer, &s, &e, FALSE);
-    push_undo_state(text);
-    g_free(text);
+    /* BUG #5 FIX: Use capture_clean_undo_state() to preserve hidden content in undo stack */
+    char *text = capture_clean_undo_state(buffer);
+    if (text) {
+        push_undo_state(text);
+        g_free(text);
+    }
 }
 
 // ---- Link Insertion Dialog ----
@@ -1172,11 +1311,218 @@ static void show_image_chooser(void) {
     g_object_unref(native);
 }
 
-// ---- Clipboard Image Paste Handler ----
-static void check_and_paste_image_from_clipboard(void) {
-    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-    if (!clipboard) return;
+// ---- Safe Image Deletion by Exact Filename ----
+static gboolean delete_image_from_buffer_by_filename(GtkTextBuffer *buffer, const char *filename) {
+    if (!buffer || !filename) return FALSE;
+    char clean_fn[128];
+    g_strlcpy(clean_fn, filename, sizeof(clean_fn));
+    char *hash = strchr(clean_fn, '#');
+    if (hash) *hash = '\0';
+    char *quote = strchr(clean_fn, '"');
+    if (quote) *quote = '\0';
 
+    char search_key[256];
+    snprintf(search_key, sizeof(search_key), "scythe://note_image/%s", clean_fn);
+
+    GtkTextIter search_start;
+    gtk_text_buffer_get_start_iter(buffer, &search_start);
+    GtkTextIter match_start, match_end;
+    if (!gtk_text_iter_forward_search(&search_start, search_key, GTK_TEXT_SEARCH_TEXT_ONLY, &match_start, &match_end, NULL)) {
+        return FALSE;
+    }
+
+    /* Found the specific image tag match. Locate ONLY its line bounds: */
+    GtkTextIter line_start = match_start;
+    gtk_text_iter_set_line_offset(&line_start, 0);
+
+    GtkTextIter line_end = match_end;
+    if (!gtk_text_iter_ends_line(&line_end)) {
+        gtk_text_iter_forward_to_line_end(&line_end);
+    }
+    /* Include trailing newline if present */
+    if (!gtk_text_iter_is_end(&line_end)) {
+        gtk_text_iter_forward_char(&line_end);
+    }
+
+    /* If the following line starts with "Captured:", include it in deletion */
+    GtkTextIter next_line_start = line_end;
+    GtkTextIter next_line_end = line_end;
+    if (!gtk_text_iter_ends_line(&next_line_end)) {
+        gtk_text_iter_forward_to_line_end(&next_line_end);
+    }
+    char *next_line_text = gtk_text_buffer_get_text(buffer, &next_line_start, &next_line_end, FALSE);
+    if (next_line_text && g_str_has_prefix(next_line_text, "Captured:")) {
+        if (!gtk_text_iter_is_end(&next_line_end)) {
+            gtk_text_iter_forward_char(&next_line_end);
+        }
+        line_end = next_line_end;
+    }
+    if (next_line_text) g_free(next_line_text);
+
+    /* Delete ONLY this image line without affecting any other images or text */
+    gtk_text_buffer_delete(buffer, &line_start, &line_end);
+    save_current_note();
+    return TRUE;
+}
+
+// ---- Internal Image Copy/Cut/Paste (for images in notes, external images, and file URIs) ----
+static gboolean copy_image_from_selection(gboolean cut) {
+    if (!notes_textview) return FALSE;
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
+    if (!buffer) return FALSE;
+
+    /* Case 1: Active clicked/focused image widget */
+    if (active_image_data_ptr) {
+        ImageWidgetData *data = (ImageWidgetData *)active_image_data_ptr;
+        if (data && data->filename) {
+            if (image_clipboard.filename) g_free(image_clipboard.filename);
+            if (image_clipboard.alignment) g_free(image_clipboard.alignment);
+            image_clipboard.filename = g_strdup(data->filename);
+            image_clipboard.width = data->current_width > 0 ? data->current_width : 450;
+            image_clipboard.alignment = g_strdup(data->alignment ? data->alignment : "center");
+            image_clipboard.has_image = TRUE;
+
+            if (data->original_pixbuf) {
+                gtk_clipboard_set_image(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), data->original_pixbuf);
+            }
+
+            if (cut) {
+                char *target_fn = g_strdup(data->filename);
+                deactivate_current_image();
+                delete_image_from_buffer_by_filename(buffer, target_fn);
+                g_free(target_fn);
+                show_status_message("Image cut to clipboard", FALSE);
+            } else {
+                show_status_message("Image copied to clipboard", FALSE);
+            }
+            return TRUE;
+        }
+    }
+
+    /* Case 2: Buffer selection containing an image tag / anchor */
+    GtkTextIter sel_start, sel_end;
+    if (gtk_text_buffer_get_selection_bounds(buffer, &sel_start, &sel_end)) {
+        char *sel_text = gtk_text_buffer_get_text(buffer, &sel_start, &sel_end, TRUE);
+        if (sel_text) {
+            char *src_pos = strstr(sel_text, "scythe://note_image/");
+            if (src_pos) {
+                src_pos += strlen("scythe://note_image/");
+                char *end_pos = strpbrk(src_pos, "\" >#\n");
+                if (end_pos) {
+                    int fn_len = end_pos - src_pos;
+                    if (fn_len > 0 && fn_len < 256) {
+                        char filename[256];
+                        strncpy(filename, src_pos, fn_len);
+                        filename[fn_len] = '\0';
+
+                        int width = 450;
+                        char *width_str = strstr(sel_text, "width=\"");
+                        if (width_str) width = atoi(width_str + 7);
+
+                        char *alignment = g_strdup("center");
+                        char *align_str = strstr(sel_text, "align=\"");
+                        if (align_str) {
+                            char *align_end = strchr(align_str + 7, '"');
+                            if (align_end) {
+                                int alen = align_end - (align_str + 7);
+                                if (alen > 0 && alen < 20) {
+                                    g_free(alignment);
+                                    alignment = g_strndup(align_str + 7, alen);
+                                }
+                            }
+                        }
+
+                        if (image_clipboard.filename) g_free(image_clipboard.filename);
+                        if (image_clipboard.alignment) g_free(image_clipboard.alignment);
+                        image_clipboard.filename = g_strdup(filename);
+                        image_clipboard.width = width > 0 ? width : 450;
+                        image_clipboard.alignment = alignment;
+                        image_clipboard.has_image = TRUE;
+
+                        char disk_path[512];
+                        snprintf(disk_path, sizeof(disk_path), "%s/%s", get_note_images_dir(), filename);
+                        GdkPixbuf *pb = gdk_pixbuf_new_from_file(disk_path, NULL);
+                        if (pb) {
+                            gtk_clipboard_set_image(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), pb);
+                            g_object_unref(pb);
+                        }
+
+                        if (cut) {
+                            delete_image_from_buffer_by_filename(buffer, filename);
+                            show_status_message("Image cut to clipboard", FALSE);
+                        } else {
+                            show_status_message("Image copied to clipboard", FALSE);
+                        }
+                        g_free(sel_text);
+                        return TRUE;
+                    }
+                }
+            }
+            g_free(sel_text);
+        }
+    }
+
+    return FALSE;
+}
+
+static gboolean paste_image_from_clipboard(void) {
+    if (!notes_textview) return FALSE;
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
+    if (!buffer) return FALSE;
+
+    GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    if (!clipboard) return FALSE;
+
+    /* 1. Check custom image clipboard first (retains image for repeated pastes) */
+    if (image_clipboard.has_image && image_clipboard.filename) {
+        char disk_path[512];
+        snprintf(disk_path, sizeof(disk_path), "%s/%s", get_note_images_dir(), image_clipboard.filename);
+
+        GdkPixbuf *pixbuf = NULL;
+        if (g_file_test(disk_path, G_FILE_TEST_EXISTS)) {
+            pixbuf = gdk_pixbuf_new_from_file(disk_path, NULL);
+        } else if (current_note_id != -1) {
+            void *db_data = NULL;
+            int db_size = 0;
+            if (note_get_image(current_note_id, image_clipboard.filename, &db_data, &db_size)) {
+                GInputStream *stream = g_memory_input_stream_new_from_data(db_data, db_size, g_free);
+                pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, NULL);
+                g_object_unref(stream);
+                gdk_pixbuf_save(pixbuf, disk_path, "png", NULL, NULL);
+            }
+        }
+
+        if (pixbuf) {
+            GtkTextMark *mark = gtk_text_buffer_get_insert(buffer);
+            GtkTextIter iter;
+            gtk_text_buffer_get_iter_at_mark(buffer, &iter, mark);
+
+            char *img_tag = g_strdup_printf("\n<img src=\"scythe://note_image/%s\" width=\"%d\" align=\"%s\" />\n",
+                                            image_clipboard.filename,
+                                            image_clipboard.width > 0 ? image_clipboard.width : 450,
+                                            image_clipboard.alignment ? image_clipboard.alignment : "center");
+            gtk_text_buffer_insert(buffer, &iter, img_tag, -1);
+            g_free(img_tag);
+
+            if (current_note_id != -1) {
+                gsize length = 0;
+                char *contents = NULL;
+                if (g_file_get_contents(disk_path, &contents, &length, NULL)) {
+                    note_save_image(current_note_id, image_clipboard.filename, contents, length);
+                    note_update_image_metadata(current_note_id, image_clipboard.filename,
+                                               image_clipboard.width, image_clipboard.alignment);
+                    g_free(contents);
+                }
+            }
+
+            g_object_unref(pixbuf);
+            show_status_message("Image pasted", FALSE);
+            /* Keep image_clipboard.has_image = TRUE so user can paste multiple times! */
+            return TRUE;
+        }
+    }
+
+    /* 2. Check system clipboard for raw image (e.g. from browser, screenshot, GIMP) */
     if (gtk_clipboard_wait_is_image_available(clipboard)) {
         GdkPixbuf *pixbuf = gtk_clipboard_wait_for_image(clipboard);
         if (pixbuf) {
@@ -1185,7 +1531,7 @@ static void check_and_paste_image_from_clipboard(void) {
             char *display_timestamp = g_date_time_format(now, "%Y-%m-%d %H:%M:%S");
 
             char filename[128];
-            snprintf(filename, sizeof(filename), "paste_%s.png", file_timestamp);
+            snprintf(filename, sizeof(filename), "paste_%s.png", file_timestamp ? file_timestamp : "img");
 
             char dest_path[512];
             snprintf(dest_path, sizeof(dest_path), "%s/%s", get_note_images_dir(), filename);
@@ -1207,31 +1553,149 @@ static void check_and_paste_image_from_clipboard(void) {
                 insert_image_into_buffer(pixbuf, filename, display_timestamp);
                 show_status_message("Pasted image attached!", FALSE);
             }
-            g_free(file_timestamp);
-            g_free(display_timestamp);
-            g_date_time_unref(now);
+            if (file_timestamp) g_free(file_timestamp);
+            if (display_timestamp) g_free(display_timestamp);
+            if (now) g_date_time_unref(now);
             g_object_unref(pixbuf);
+            return TRUE;
         }
     }
+
+    /* 3. Check system clipboard text for file path(s) / file URI(s) (e.g. from file manager) */
+    if (gtk_clipboard_wait_is_text_available(clipboard)) {
+        char *text = gtk_clipboard_wait_for_text(clipboard);
+        if (text) {
+            gboolean pasted_any = FALSE;
+            char **lines = g_strsplit_set(text, "\r\n", -1);
+            if (lines) {
+                for (int i = 0; lines[i] != NULL; i++) {
+                    char *line = lines[i];
+                    g_strstrip(line);
+                    if (strlen(line) == 0) continue;
+
+                    /* Strip surrounding quotes if present */
+                    if ((line[0] == '"' || line[0] == '\'') && strlen(line) >= 2) {
+                        line[strlen(line) - 1] = '\0';
+                        line++;
+                        g_strstrip(line);
+                    }
+
+                    char *filepath = NULL;
+                    if (g_str_has_prefix(line, "file://")) {
+                        GError *uri_err = NULL;
+                        filepath = g_filename_from_uri(line, NULL, &uri_err);
+                        if (uri_err) { g_error_free(uri_err); filepath = NULL; }
+                    } else if (line[0] == '/' || g_str_has_prefix(line, "~/") || (strlen(line) > 2 && line[1] == ':')) {
+                        filepath = g_strdup(line);
+                    }
+
+                    if (filepath && g_file_test(filepath, G_FILE_TEST_EXISTS)) {
+                        GError *img_err = NULL;
+                        GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(filepath, &img_err);
+                        if (pixbuf) {
+                            GDateTime *now = g_date_time_new_now_local();
+                            char *file_timestamp = g_date_time_format(now, "%Y%m%d_%H%M%S");
+                            char *display_timestamp = g_date_time_format(now, "%Y-%m-%d %H:%M:%S");
+
+                            char *base_name = g_path_get_basename(filepath);
+                            char filename[256];
+                            snprintf(filename, sizeof(filename), "imported_%s_%s",
+                                     file_timestamp ? file_timestamp : "img",
+                                     base_name ? base_name : "image.png");
+
+                            char dest_path[512];
+                            snprintf(dest_path, sizeof(dest_path), "%s/%s", get_note_images_dir(), filename);
+
+                            GError *save_err = NULL;
+                            gdk_pixbuf_save(pixbuf, dest_path, "png", &save_err, NULL);
+                            if (!save_err) {
+                                gsize len = 0;
+                                char *data = NULL;
+                                if (g_file_get_contents(dest_path, &data, &len, NULL)) {
+                                    if (current_note_id == -1) save_current_note();
+                                    if (current_note_id != -1) {
+                                        note_save_image(current_note_id, filename, data, len);
+                                    }
+                                    g_free(data);
+                                }
+                                insert_image_into_buffer(pixbuf, filename, display_timestamp);
+                                pasted_any = TRUE;
+                            }
+                            if (save_err) g_error_free(save_err);
+                            if (base_name) g_free(base_name);
+                            if (file_timestamp) g_free(file_timestamp);
+                            if (display_timestamp) g_free(display_timestamp);
+                            if (now) g_date_time_unref(now);
+                            g_object_unref(pixbuf);
+                        }
+                        if (img_err) g_error_free(img_err);
+                    }
+                    if (filepath) g_free(filepath);
+                }
+                g_strfreev(lines);
+            }
+            g_free(text);
+            if (pasted_any) {
+                show_status_message("File image pasted & attached!", FALSE);
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
 }
 
 // ---- Undo / Redo Actions ----
 static void do_undo(void) {
-    if (!undo_stack || undo_stack->len <= 1 || !notes_textview) return;
+    if (!notes_textview) return;
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
+    if (!buffer) return;
+
+    /* Flush any pending timer snapshot using clean capture (strips ORCs) */
+    if (undo_timer_id != 0) {
+        g_source_remove(undo_timer_id);
+        /* Also unref the buffer we ref'd in schedule_undo_push */
+        undo_timer_id = 0;
+        char *text = capture_clean_undo_state(buffer);
+        if (text) {
+            push_undo_state(text);
+            g_free(text);
+        }
+    }
+
+    if (!undo_stack || undo_stack->len <= 1) return;
 
     in_undo_redo = TRUE;
+    cancel_pending_render();
 
-    char *curr = g_ptr_array_remove_index(undo_stack, undo_stack->len - 1);
+    /* RC-5 fix: clear active image pointer BEFORE set_text destroys child anchor widgets.
+     * free_image_widget_data() will be called during set_text destruction and checks
+     * active_image_data_ptr — ensure it's NULL before any widget destruction occurs. */
+    active_image_data_ptr = NULL;
+
+    /* RC-9 fix: Copy snapshot BEFORE modifying stacks (atomic transition).
+     * If set_text somehow fails or throws, stacks remain consistent. */
+    const char *prev_raw = g_ptr_array_index(undo_stack, undo_stack->len - 2);
+    char *prev = g_strdup(prev_raw ? prev_raw : "");
+
+    /* Move top of undo stack to redo — only AFTER we have prev safely copied */
+    const char *curr_raw = g_ptr_array_index(undo_stack, undo_stack->len - 1);
+    char *curr = g_strdup(curr_raw ? curr_raw : "");
+    g_ptr_array_remove_index(undo_stack, undo_stack->len - 1); // This frees the original
+
     if (!redo_stack) redo_stack = g_ptr_array_new_with_free_func(g_free);
     g_ptr_array_add(redo_stack, curr);
 
-    const char *prev = g_ptr_array_index(undo_stack, undo_stack->len - 1);
+    /* Phase 1 (synchronous, signals blocked): set text only */
+    g_signal_handlers_block_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
+    gtk_text_buffer_set_text(buffer, prev, -1);
+    g_signal_handlers_unblock_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
+    g_free(prev);
 
-    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
-    if (buffer) {
-        gtk_text_buffer_set_text(buffer, prev ? prev : "", -1);
-        apply_markdown_tags(buffer);
-    }
+    /* Phase 2 (deferred): image re-anchor + markdown tag render in safe idle context.
+     * RC-2 fix: parse_and_render_images_in_buffer() is no longer called here with
+     * signals blocked — it now runs via render_idle_cb() after set_text() completes. */
+    schedule_render(buffer);
 
     show_status_message("Undo", FALSE);
     in_undo_redo = FALSE;
@@ -1239,20 +1703,35 @@ static void do_undo(void) {
 
 static void do_redo(void) {
     if (!redo_stack || redo_stack->len == 0 || !notes_textview) return;
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
+    if (!buffer) return;
 
     in_undo_redo = TRUE;
+    cancel_pending_render();
 
-    char *next = g_ptr_array_remove_index(redo_stack, redo_stack->len - 1);
+    /* RC-5 fix: clear before widget destruction in set_text */
+    active_image_data_ptr = NULL;
+
+    /* RC-9 fix: copy next state before modifying stacks */
+    const char *next_raw = g_ptr_array_index(redo_stack, redo_stack->len - 1);
+    char *next = g_strdup(next_raw ? next_raw : "");
+
+    const char *popped_raw = g_ptr_array_index(redo_stack, redo_stack->len - 1);
+    char *popped = g_strdup(popped_raw ? popped_raw : "");
+    g_ptr_array_remove_index(redo_stack, redo_stack->len - 1); // This frees the original
+
     if (!undo_stack) undo_stack = g_ptr_array_new_with_free_func(g_free);
-    g_ptr_array_add(undo_stack, g_strdup(next));
+    g_ptr_array_add(undo_stack, popped);
 
-    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
-    if (buffer) {
-        gtk_text_buffer_set_text(buffer, next ? next : "", -1);
-        apply_markdown_tags(buffer);
-    }
-
+    /* Phase 1: set text with signals blocked */
+    g_signal_handlers_block_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
+    gtk_text_buffer_set_text(buffer, next, -1);
+    g_signal_handlers_unblock_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
     g_free(next);
+
+    /* Phase 2: deferred image + tag rendering */
+    schedule_render(buffer);
+
     show_status_message("Redo", FALSE);
     in_undo_redo = FALSE;
 }
@@ -1296,19 +1775,41 @@ static void parse_and_render_images_in_buffer(GtkTextBuffer *buffer) {
             char disk_path[512];
             snprintf(disk_path, sizeof(disk_path), "%s/%s", get_note_images_dir(), clean_fn);
 
+            /* FUNC-002 FIX: Add proper error handling for image load failures */
             GdkPixbuf *pixbuf = NULL;
+            GError *error = NULL;
+
             if (g_file_test(disk_path, G_FILE_TEST_EXISTS)) {
-                pixbuf = gdk_pixbuf_new_from_file(disk_path, NULL);
+                pixbuf = gdk_pixbuf_new_from_file(disk_path, &error);
+                if (error) {
+                    g_warning("Failed to load image %s: %s", clean_fn, error->message);
+                    g_error_free(error);
+                    error = NULL;
+                }
             } else if (current_note_id != -1) {
                 void *db_data = NULL;
                 int db_size = 0;
                 if (note_get_image(current_note_id, clean_fn, &db_data, &db_size)) {
                     GInputStream *stream = g_memory_input_stream_new_from_data(db_data, db_size, g_free);
-                    pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, NULL);
+                    pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, &error);
+                    if (error) {
+                        g_warning("Failed to decode image %s from database: %s", clean_fn, error->message);
+                        g_error_free(error);
+                        error = NULL;
+                    }
                     g_object_unref(stream);
-                    gdk_pixbuf_save(pixbuf, disk_path, "png", NULL, NULL);
+                    if (pixbuf) {
+                        gdk_pixbuf_save(pixbuf, disk_path, "png", NULL, &error);
+                        if (error) {
+                            g_warning("Failed to cache image %s to disk: %s", clean_fn, error->message);
+                            g_error_free(error);
+                            error = NULL;
+                        }
+                    }
                 }
             }
+
+            GtkTextMark *fn_end_mark = gtk_text_buffer_create_mark(buffer, NULL, &fn_end, FALSE);
 
             if (pixbuf) {
                 /* Walk back to tag opening '<' or use match_start */
@@ -1318,16 +1819,43 @@ static void parse_and_render_images_in_buffer(GtkTextBuffer *buffer) {
                     if (gtk_text_iter_get_char(&tag_anchor_pos) == '<') break;
                 }
 
-                /* Check if an anchor already exists at this iter */
-                if (!gtk_text_iter_get_child_anchor(&tag_anchor_pos)) {
+                /* RC-9 fix: scan the ENTIRE region from tag_anchor_pos to fn_end
+                 * for any existing child anchor (U+FFFC). After update_image_tag_in_markdown
+                 * rewrites the tag, the anchor may be at a different offset than '<'. */
+                gboolean anchor_exists = FALSE;
+                {
+                    GtkTextIter scan = tag_anchor_pos;
+                    GtkTextIter scan_limit;
+                    gtk_text_buffer_get_iter_at_mark(buffer, &scan_limit, fn_end_mark);
+                    while (gtk_text_iter_compare(&scan, &scan_limit) < 0) {
+                        if (gtk_text_iter_get_child_anchor(&scan)) {
+                            anchor_exists = TRUE;
+                            break;
+                        }
+                        if (!gtk_text_iter_forward_char(&scan)) break;
+                    }
+                }
+
+                if (!anchor_exists) {
+                    /* FUNC-001 FIX: Prevent anchor creation from polluting undo stack */
+                    user_initiated_change = FALSE;
+                    /* Block signals: create_child_anchor inserts U+FFFC (a buffer
+                     * modification) which would re-trigger on_buffer_changed_render
+                     * and schedule another parse_and_render pass → infinite loop. */
+                    g_signal_handlers_block_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
                     GtkTextChildAnchor *anchor = gtk_text_buffer_create_child_anchor(buffer, &tag_anchor_pos);
+                    g_signal_handlers_unblock_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
                     GtkWidget *widget = create_resizable_image_widget(pixbuf, clean_fn, req_w, req_align);
                     if (widget && anchor && notes_textview) {
                         gtk_text_view_add_child_at_anchor(GTK_TEXT_VIEW(notes_textview), widget, anchor);
                     }
+                    user_initiated_change = TRUE;
                 }
                 g_object_unref(pixbuf);
             }
+
+            gtk_text_buffer_get_iter_at_mark(buffer, &fn_end, fn_end_mark);
+            gtk_text_buffer_delete_mark(buffer, fn_end_mark);
 
             g_free(clean_fn);
             if (req_align) g_free(req_align);
@@ -1342,34 +1870,69 @@ static void load_note_into_editor(int note_id) {
 
     char *content = note_get_content(note_id);
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
-    if (!buffer) return;
+    if (!buffer) {
+        if (content) g_free(content);
+        return;
+    }
 
-    g_signal_handlers_block_matched(buffer, G_SIGNAL_MATCH_FUNC,
-        0, 0, NULL, G_CALLBACK(schedule_render), NULL);
+    cancel_pending_render();
 
+    /* RC-5 fix: clear active image pointer BEFORE set_text destroys old note's widgets */
+    active_image_data_ptr = NULL;
+
+    /* Phase 1: set text with signals blocked (safe, no anchor creation here) */
+    g_signal_handlers_block_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
     if (content) {
         gtk_text_buffer_set_text(buffer, content, -1);
         g_free(content);
     } else {
         gtk_text_buffer_set_text(buffer, "", -1);
     }
+    g_signal_handlers_unblock_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
 
     current_note_id = note_id;
     current_edit_line = -1;
     clear_undo_redo_stacks();
 
-    parse_and_render_images_in_buffer(buffer);
+    /* Push the initial clean undo state using RC-4 safe capture (strips ORCs) */
+    char *clean_snap = capture_clean_undo_state(buffer);
+    if (clean_snap) {
+        push_undo_state(clean_snap);
+        g_free(clean_snap);
+    }
 
-    g_signal_handlers_unblock_matched(buffer, G_SIGNAL_MATCH_FUNC,
-        0, 0, NULL, G_CALLBACK(schedule_render), NULL);
+    /* Phase 2: deferred image parsing + tag rendering via safe idle callback (RC-2/RC-3 fix).
+     * parse_and_render_images_in_buffer() is called in render_idle_cb() AFTER this function
+     * returns, when no signals are blocked and iterators are fresh and valid. */
+    schedule_render(buffer);
+}
 
-    GtkTextIter s, e;
-    gtk_text_buffer_get_bounds(buffer, &s, &e);
-    char *text = gtk_text_buffer_get_text(buffer, &s, &e, FALSE);
-    push_undo_state(text);
-    g_free(text);
+static char *extract_smart_title_from_text(const char *text) {
+    if (!text || strlen(text) == 0) return NULL;
+    char **lines = g_strsplit(text, "\n", 0);
+    if (!lines) return NULL;
 
-    apply_markdown_tags(buffer);
+    char *title = NULL;
+    for (int i = 0; lines[i] != NULL; i++) {
+        char *line = lines[i];
+        while (*line == '#' || *line == ' ' || *line == '\t' || *line == '*' || *line == '_' || *line == '-') {
+            line++;
+        }
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t' || line[len-1] == '\r' || line[len-1] == '*' || line[len-1] == '_')) {
+            line[len-1] = '\0';
+            len--;
+        }
+        if (len > 0) {
+            if (len > 40) {
+                line[40] = '\0';
+            }
+            title = g_strdup(line);
+            break;
+        }
+    }
+    g_strfreev(lines);
+    return title;
 }
 
 static void save_current_note(void) {
@@ -1377,30 +1940,147 @@ static void save_current_note(void) {
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
     if (!buffer) return;
 
-    GtkTextIter start, end;
-    gtk_text_buffer_get_bounds(buffer, &start, &end);
-    char *text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+    int session_id = session_get_current();
+    if (session_id == -1) {
+        /* BUG #7 FIX: Upgrade from passive status bar to blocking modal dialog.
+         * Previously used show_status_message() which was easily missed. Now we
+         * immediately interrupt the user with a modal alert that their current
+         * workspace data is orphaned and cannot be saved. */
+        GtkWidget *toplevel = gtk_widget_get_toplevel(notes_textview);
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL,
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_OK,
+            "Session Deleted - Data Cannot Be Saved"
+        );
+        gtk_message_dialog_format_secondary_text(
+            GTK_MESSAGE_DIALOG(dialog),
+            "The current session has been deleted. Your note content cannot be saved.\n\n"
+            "Please create a new note or load a different session to continue working."
+        );
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+
+    /* BUG #5 FIX: Use capture_clean_undo_state() logic to preserve hidden content.
+     * Previously used gtk_text_buffer_get_text(..., FALSE) which stripped out
+     * hidden markdown syntax and <img> tags, causing them to disappear when
+     * switching notes. Now we capture with include_hidden_chars=TRUE and strip
+     * only U+FFFC Object Replacement Characters inserted by child anchors. */
+    char *text = capture_clean_undo_state(buffer);
 
     if (current_note_id != -1) {
-        note_update_content(current_note_id, text);
+        if (!note_update_content(current_note_id, text)) {
+            GtkWidget *toplevel = gtk_widget_get_toplevel(notes_textview);
+            GtkWidget *dialog = gtk_message_dialog_new(
+                GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL,
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK,
+                "Save Failed"
+            );
+            gtk_message_dialog_format_secondary_text(
+                GTK_MESSAGE_DIALOG(dialog),
+                "Failed to update note content in the database. The session or note may have been deleted."
+            );
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
+            g_free(text);
+            return;
+        }
         show_status_message("Autosaved", FALSE);
+
+        char *current_title = NULL;
+        GPtrArray *notes = note_list_by_session(session_id);
+        if (notes) {
+            for (guint i = 0; i < notes->len; i++) {
+                NoteInfo *info = g_ptr_array_index(notes, i);
+                if (info && info->id == current_note_id) {
+                    current_title = g_strdup(info->title);
+                    break;
+                }
+            }
+            g_ptr_array_free(notes, TRUE);
+        }
+
+        gboolean is_default_title = FALSE;
+        if (!current_title || g_str_has_prefix(current_title, "Note ") || g_strcmp0(current_title, "Untitled Note") == 0 || strlen(current_title) == 0) {
+            is_default_title = TRUE;
+        }
+
+        if (is_default_title && text && strlen(text) > 0) {
+            char *smart_title = extract_smart_title_from_text(text);
+            if (smart_title) {
+                if (g_strcmp0(current_title, smart_title) != 0) {
+                    note_rename(current_note_id, smart_title);
+                    refresh_notes_list();
+                }
+                g_free(smart_title);
+            }
+        }
+        g_free(current_title);
+
     } else if (text && strlen(text) > 0) {
-        int session_id = session_get_current();
-        if (session_id != -1) {
-            char title[64];
+        char title[64];
+        char *smart_title = extract_smart_title_from_text(text);
+        if (smart_title) {
+            snprintf(title, sizeof(title), "%s", smart_title);
+            g_free(smart_title);
+        } else {
             GDateTime *now = g_date_time_new_now_local();
-            char *time_str = g_date_time_format(now, "%Y-%m-%d %H:%M:%S");
+            char *time_str = now ? g_date_time_format(now, "%Y-%m-%d %H:%M:%S") : NULL;
             snprintf(title, sizeof(title), "Note %s", time_str ? time_str : "");
             if (time_str) g_free(time_str);
             if (now) g_date_time_unref(now);
-            current_note_id = note_create(session_id, title);
-            if (current_note_id != -1) {
-                note_update_content(current_note_id, text);
-                show_status_message("Note created & saved", FALSE);
-            }
+        }
+
+        current_note_id = note_create(session_id, title);
+        if (current_note_id != -1) {
+            note_update_content(current_note_id, text);
+            show_status_message("Note created & saved", FALSE);
+            refresh_notes_list();
+        } else {
+            GtkWidget *toplevel = gtk_widget_get_toplevel(notes_textview);
+            GtkWidget *dialog = gtk_message_dialog_new(
+                GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL,
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK,
+                "Note Creation Failed"
+            );
+            gtk_message_dialog_format_secondary_text(
+                GTK_MESSAGE_DIALOG(dialog),
+                "Failed to create new note in the database. The active session may have been deleted."
+            );
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
         }
     }
     g_free(text);
+}
+
+void notes_reset_state(void) {
+    current_note_id = -1;
+    current_edit_line = -1;
+    active_image_data_ptr = NULL;
+    clear_undo_redo_stacks();
+    cancel_pending_render();
+    if (notes_textview) {
+        GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
+        if (buffer) {
+            g_signal_handlers_block_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
+            gtk_text_buffer_set_text(buffer, "", -1);
+            g_signal_handlers_unblock_by_func(buffer, G_CALLBACK(on_buffer_changed_render), NULL);
+        }
+    }
+    if (notes_combo) {
+        g_signal_handlers_block_by_func(notes_combo, G_CALLBACK(on_note_selected), NULL);
+        gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(notes_combo));
+        g_signal_handlers_unblock_by_func(notes_combo, G_CALLBACK(on_note_selected), NULL);
+    }
+    show_status_message("Current Session Data Deleted", TRUE);
 }
 
 static void refresh_notes_list(void) {
@@ -1458,6 +2138,8 @@ void notes_refresh(void) {
 }
 
 static void on_snip_clicked(GtkButton *button, gpointer user_data);
+static void on_pin_toggled(GtkToggleButton *button, gpointer user_data);
+static void on_note_toggled(GtkToggleButton *button, gpointer user_data);
 
 void notes_trigger_snip(void) {
     on_snip_clicked(NULL, NULL);
@@ -1479,11 +2161,31 @@ void notes_toggle(void) {
     if (!notes_popover) return;
     if (gtk_widget_get_visible(notes_popover)) {
         if (is_notes_pinned) {
-            notes_toggle_pin();
+            is_notes_pinned = FALSE;
+            if (g_pin_toggle_btn) {
+                g_signal_handlers_block_by_func(g_pin_toggle_btn, G_CALLBACK(on_pin_toggled), NULL);
+                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_pin_toggle_btn), FALSE);
+                GtkStyleContext *ctx = gtk_widget_get_style_context(GTK_WIDGET(g_pin_toggle_btn));
+                gtk_style_context_remove_class(ctx, "pin-active");
+                gtk_button_set_label(GTK_BUTTON(g_pin_toggle_btn), "●");
+                gtk_widget_set_tooltip_text(GTK_WIDGET(g_pin_toggle_btn), "Pin: Keep Notes panel open");
+                gtk_widget_queue_draw(GTK_WIDGET(g_pin_toggle_btn));
+                g_signal_handlers_unblock_by_func(g_pin_toggle_btn, G_CALLBACK(on_pin_toggled), NULL);
+            }
+        }
+        if (g_note_toggle_btn) {
+            g_signal_handlers_block_by_func(g_note_toggle_btn, G_CALLBACK(on_note_toggled), NULL);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_note_toggle_btn), FALSE);
+            g_signal_handlers_unblock_by_func(g_note_toggle_btn, G_CALLBACK(on_note_toggled), NULL);
         }
         gtk_popover_popdown(GTK_POPOVER(notes_popover));
     } else {
         refresh_notes_list();
+        if (g_note_toggle_btn) {
+            g_signal_handlers_block_by_func(g_note_toggle_btn, G_CALLBACK(on_note_toggled), NULL);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_note_toggle_btn), TRUE);
+            g_signal_handlers_unblock_by_func(g_note_toggle_btn, G_CALLBACK(on_note_toggled), NULL);
+        }
         gtk_popover_popup(GTK_POPOVER(notes_popover));
         if (notes_textview) gtk_widget_grab_focus(notes_textview);
     }
@@ -1498,7 +2200,17 @@ static void on_note_toggled(GtkToggleButton *button, gpointer user_data) {
         if (notes_textview) gtk_widget_grab_focus(notes_textview);
     } else {
         if (is_notes_pinned) {
-            notes_toggle_pin();
+            is_notes_pinned = FALSE;
+            if (g_pin_toggle_btn) {
+                g_signal_handlers_block_by_func(g_pin_toggle_btn, G_CALLBACK(on_pin_toggled), NULL);
+                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_pin_toggle_btn), FALSE);
+                GtkStyleContext *ctx = gtk_widget_get_style_context(GTK_WIDGET(g_pin_toggle_btn));
+                gtk_style_context_remove_class(ctx, "pin-active");
+                gtk_button_set_label(GTK_BUTTON(g_pin_toggle_btn), "●");
+                gtk_widget_set_tooltip_text(GTK_WIDGET(g_pin_toggle_btn), "Pin: Keep Notes panel open");
+                gtk_widget_queue_draw(GTK_WIDGET(g_pin_toggle_btn));
+                g_signal_handlers_unblock_by_func(g_pin_toggle_btn, G_CALLBACK(on_pin_toggled), NULL);
+            }
         }
         gtk_popover_popdown(GTK_POPOVER(notes_popover));
     }
@@ -1510,11 +2222,27 @@ void close_notes_if_unpinned(void) {
     }
 }
 
+static gboolean is_widget_or_ancestor_popover_or_menu(GtkWidget *w) {
+    while (w) {
+        if (GTK_IS_MENU(w) || GTK_IS_POPOVER(w) || GTK_IS_MENU_ITEM(w) || GTK_IS_MENU_SHELL(w)) {
+            return TRUE;
+        }
+        if (GTK_IS_WINDOW(w) && gtk_window_get_window_type(GTK_WINDOW(w)) == GTK_WINDOW_POPUP) {
+            return TRUE;
+        }
+        w = gtk_widget_get_parent(w);
+    }
+    return FALSE;
+}
+
 gboolean notes_handle_window_click(GdkEventButton *event) {
     if (!event || !notes_popover) return FALSE;
     if (gtk_widget_get_visible(notes_popover) && !is_notes_pinned) {
         GtkWidget *target = gtk_get_event_widget((GdkEvent *)event);
         if (target && target != notes_popover && !gtk_widget_is_ancestor(target, notes_popover) && target != g_note_toggle_btn) {
+            if (is_widget_or_ancestor_popover_or_menu(target)) {
+                return FALSE;
+            }
             close_notes_if_unpinned();
         }
     }
@@ -1526,20 +2254,31 @@ static void on_pin_toggled(GtkToggleButton *button, gpointer user_data) {
     if (notes_popover) {
         gtk_popover_set_modal(GTK_POPOVER(notes_popover), FALSE);
     }
-    /* Color-only state indicator: red fill = locked, default = unlocked */
     if (g_pin_toggle_btn) {
         GtkStyleContext *ctx = gtk_widget_get_style_context(GTK_WIDGET(g_pin_toggle_btn));
         if (is_notes_pinned) {
             gtk_style_context_add_class(ctx, "pin-active");
+            gtk_button_set_label(GTK_BUTTON(g_pin_toggle_btn), "●");
+            gtk_widget_set_tooltip_text(GTK_WIDGET(g_pin_toggle_btn), "Pinned: Notes panel stays open (click to unpin)");
+            show_status_message("Notes pinned open", FALSE);
         } else {
             gtk_style_context_remove_class(ctx, "pin-active");
+            gtk_button_set_label(GTK_BUTTON(g_pin_toggle_btn), "●");
+            gtk_widget_set_tooltip_text(GTK_WIDGET(g_pin_toggle_btn), "Pin: Keep Notes panel open");
+            show_status_message("Notes unpinned", FALSE);
         }
+        gtk_widget_queue_draw(GTK_WIDGET(g_pin_toggle_btn));
     }
 }
 
 static void on_popover_closed(GtkPopover *popover, gpointer user_data) {
     save_current_note();
-    if (!is_notes_pinned && g_note_toggle_btn) {
+    if (is_notes_pinned) {
+        /* When pinned, keep the popover open even if user interacts with terminal / other widgets */
+        gtk_popover_popup(popover);
+        return;
+    }
+    if (g_note_toggle_btn) {
         g_signal_handlers_block_by_func(g_note_toggle_btn, G_CALLBACK(on_note_toggled), NULL);
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_note_toggle_btn), FALSE);
         g_signal_handlers_unblock_by_func(g_note_toggle_btn, G_CALLBACK(on_note_toggled), NULL);
@@ -1734,18 +2473,24 @@ static gboolean handle_list_enter(GtkTextBuffer *buffer) {
     }
 
     g_free(line);
-    GtkTextIter s, e;
-    gtk_text_buffer_get_bounds(buffer, &s, &e);
-    char *full = gtk_text_buffer_get_text(buffer, &s, &e, FALSE);
-    push_undo_state(full);
-    g_free(full);
+    /* BUG #5 FIX: Use capture_clean_undo_state() to preserve hidden content in undo stack */
+    char *full = capture_clean_undo_state(buffer);
+    if (full) {
+        push_undo_state(full);
+        g_free(full);
+    }
     return TRUE;
 }
 
 // ---- Clickable Link Handler ----
 static gboolean on_textview_button_release(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
     if (!widget || event->button != 1) return FALSE;
-    if (event->state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK)) return FALSE;
+
+    /* Phase 8 fix: Ctrl+Click opens links; plain click allows editing.
+     * Previously this rejected Ctrl+Click — now we REQUIRE it for link activation. */
+    if (!(event->state & GDK_CONTROL_MASK)) return FALSE;
+    /* Shift+Ctrl should not open links (user may be selecting) */
+    if (event->state & GDK_SHIFT_MASK) return FALSE;
 
     GtkTextView *tv = GTK_TEXT_VIEW(widget);
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(tv);
@@ -1781,14 +2526,16 @@ static gboolean on_textview_button_release(GtkWidget *widget, GdkEventButton *ev
     const char *lp = full_line;
     /* Get link text from visible selection to match the right link */
     GtkTextIter tag_start = click_iter, tag_end = click_iter;
-    gtk_text_iter_backward_to_tag_toggle(&tag_start, link_tag);
+    if (!gtk_text_iter_starts_tag(&tag_start, link_tag)) {
+        gtk_text_iter_backward_to_tag_toggle(&tag_start, link_tag);
+    }
     gtk_text_iter_forward_to_tag_toggle(&tag_end, link_tag);
     char *link_text = gtk_text_buffer_get_text(buffer, &tag_start, &tag_end, FALSE);
 
     gboolean launched = FALSE;
     if (link_text) {
         char *search_pat = g_strdup_printf("[%s](", link_text);
-        char *found = strstr(lp, search_pat);
+        const char *found = strstr(lp, search_pat);
         if (found) {
             const char *url_s = found + strlen(search_pat);
             const char *url_e = strchr(url_s, ')');
@@ -1801,17 +2548,44 @@ static gboolean on_textview_button_release(GtkWidget *widget, GdkEventButton *ev
                     full_url = g_strdup_printf("https://%s", url);
                 }
                 GError *err = NULL;
-                g_app_info_launch_default_for_uri(full_url, NULL, &err);
+                gtk_show_uri_on_window(GTK_WINDOW(gtk_widget_get_toplevel(widget)), full_url, GDK_CURRENT_TIME, &err);
                 if (err) {
                     g_error_free(err);
-                } else {
-                    launched = TRUE;
+                    err = NULL;
+                    g_app_info_launch_default_for_uri(full_url, NULL, &err);
+                    if (err) g_error_free(err);
                 }
+                launched = TRUE;
                 if (full_url != url) g_free(full_url);
                 g_free(url);
             }
         }
         g_free(search_pat);
+
+        // Fallback for bare URLs if not in markdown [text](url) format
+        if (!launched) {
+            char *clean_link = g_strdup(link_text);
+            g_strstrip(clean_link);
+            if (strlen(clean_link) > 0) {
+                char *full_url = clean_link;
+                if (!g_str_has_prefix(clean_link, "http://") && !g_str_has_prefix(clean_link, "https://") &&
+                    !g_str_has_prefix(clean_link, "ftp://") && !g_str_has_prefix(clean_link, "mailto:")) {
+                    full_url = g_strdup_printf("https://%s", clean_link);
+                }
+                GError *err = NULL;
+                gtk_show_uri_on_window(GTK_WINDOW(gtk_widget_get_toplevel(widget)), full_url, GDK_CURRENT_TIME, &err);
+                if (err) {
+                    g_error_free(err);
+                    err = NULL;
+                    g_app_info_launch_default_for_uri(full_url, NULL, &err);
+                    if (err) g_error_free(err);
+                }
+                launched = TRUE;
+                if (full_url != clean_link) g_free(full_url);
+            }
+            g_free(clean_link);
+        }
+
         g_free(link_text);
     }
     g_free(full_line);
@@ -1831,6 +2605,53 @@ static gboolean on_editor_key_press(GtkWidget *widget, GdkEventKey *event, gpoin
         return FALSE;
     }
 
+    // Delete/Backspace: Remove active or selected image if any
+    if (state == 0 && (event->keyval == GDK_KEY_Delete || event->keyval == GDK_KEY_BackSpace)) {
+        GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget));
+        if (!buffer) return FALSE;
+
+        /* Case 1: Active clicked image */
+        if (active_image_data_ptr) {
+            ImageWidgetData *data = (ImageWidgetData *)active_image_data_ptr;
+            if (data && data->filename) {
+                char *target_fn = g_strdup(data->filename);
+                deactivate_current_image();
+                delete_image_from_buffer_by_filename(buffer, target_fn);
+                g_free(target_fn);
+                show_status_message("Image deleted", FALSE);
+                return TRUE;
+            }
+        }
+
+        /* Case 2: Buffer selection with image anchor */
+        GtkTextIter sel_start, sel_end;
+        if (gtk_text_buffer_get_selection_bounds(buffer, &sel_start, &sel_end)) {
+            char *sel_text = gtk_text_buffer_get_text(buffer, &sel_start, &sel_end, TRUE);
+            if (sel_text) {
+                char *src_pos = strstr(sel_text, "scythe://note_image/");
+                if (src_pos) {
+                    src_pos += strlen("scythe://note_image/");
+                    char *end_pos = strpbrk(src_pos, "\" >#\n");
+                    if (end_pos) {
+                        int fn_len = end_pos - src_pos;
+                        if (fn_len > 0 && fn_len < 256) {
+                            char filename[256];
+                            strncpy(filename, src_pos, fn_len);
+                            filename[fn_len] = '\0';
+                            g_free(sel_text);
+                            deactivate_current_image();
+                            delete_image_from_buffer_by_filename(buffer, filename);
+                            show_status_message("Image deleted", FALSE);
+                            return TRUE;
+                        }
+                    }
+                }
+                g_free(sel_text);
+            }
+        }
+        return FALSE; /* Let default delete handle text */
+    }
+
     // Escape key closes unpinned notes popover
     if (state == 0 && event->keyval == GDK_KEY_Escape) {
         if (!is_notes_pinned && notes_popover) {
@@ -1838,9 +2659,6 @@ static gboolean on_editor_key_press(GtkWidget *widget, GdkEventKey *event, gpoin
             return TRUE;
         }
     }
-
-    // Any plain keypress deactivates active image toolbar
-    if (state == 0) deactivate_current_image();
 
     if (state == GDK_CONTROL_MASK) {
         switch (event->keyval) {
@@ -1876,10 +2694,24 @@ static gboolean on_editor_key_press(GtkWidget *widget, GdkEventKey *event, gpoin
             case GDK_KEY_Y:
                 do_redo();
                 return TRUE;
+            case GDK_KEY_c:
+            case GDK_KEY_C:
+                if (copy_image_from_selection(FALSE)) {
+                    return TRUE;
+                }
+                return FALSE; /* Allow default text copy if no image */
+            case GDK_KEY_x:
+            case GDK_KEY_X:
+                if (copy_image_from_selection(TRUE)) {
+                    return TRUE;
+                }
+                return FALSE; /* Allow default text cut if no image */
             case GDK_KEY_v:
             case GDK_KEY_V:
-                check_and_paste_image_from_clipboard();
-                return FALSE;
+                if (paste_image_from_clipboard()) {
+                    return TRUE;
+                }
+                return FALSE; /* Allow default text paste if no image */
         }
     } else if (state == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) {
         switch (event->keyval) {
@@ -1893,6 +2725,9 @@ static gboolean on_editor_key_press(GtkWidget *widget, GdkEventKey *event, gpoin
                 return TRUE;
         }
     }
+
+    // Any plain keypress deactivates active image toolbar
+    if (state == 0) deactivate_current_image();
 
     return FALSE;
 }
@@ -2126,6 +2961,7 @@ static void on_buffer_changed_render(GtkTextBuffer *buffer, gpointer user_data) 
     gtk_text_buffer_get_iter_at_mark(buffer, &iter, mark);
     current_edit_line = gtk_text_iter_get_line(&iter);
     schedule_render(buffer);
+    schedule_undo_push(buffer);
 }
 
 /* ---- Resize Grip State ---- */
@@ -2182,44 +3018,71 @@ static void copy_file_simple(const char *src, const char *dst) {
     }
 }
 
-static void export_as_markdown(void) {
-    if (!notes_textview) return;
-    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
-    if (!buffer) return;
+static void export_note_content_to_file(int note_id, const char *filepath, gboolean is_pdf) {
+    if (note_id == -1 || !filepath) return;
+    char *text = note_get_content(note_id);
+    if (!text) text = g_strdup("");
 
-    GtkTextIter s, e;
-    gtk_text_buffer_get_bounds(buffer, &s, &e);
-    char *text = gtk_text_buffer_get_text(buffer, &s, &e, TRUE);
-    if (!text || strlen(text) == 0) {
-        g_free(text);
-        return;
-    }
+    if (!is_pdf) {
+        char *target_dir = g_path_get_dirname(filepath);
+        GString *out = g_string_new("");
+        char **lines = g_strsplit(text, "\n", -1);
 
-    GtkWidget *toplevel = gtk_widget_get_toplevel(notes_textview);
-    GtkWindow *parent_win = GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL;
+        for (int i = 0; lines && lines[i]; i++) {
+            const char *line = lines[i];
+            if (g_str_has_prefix(line, "<img src=\"scythe://note_image/")) {
+                const char *fn_start = line + strlen("<img src=\"scythe://note_image/");
+                const char *fn_end = strchr(fn_start, '"');
+                if (fn_end && fn_end > fn_start) {
+                    char *fn = g_strndup(fn_start, fn_end - fn_start);
+                    char src_p[512], dst_p[512];
+                    snprintf(src_p, sizeof(src_p), "%s/%s", get_note_images_dir(), fn);
+                    snprintf(dst_p, sizeof(dst_p), "%s/%s", target_dir, fn);
 
-    GtkFileChooserNative *native = gtk_file_chooser_native_new(
-        "Export as Markdown",
-        parent_win,
-        GTK_FILE_CHOOSER_ACTION_SAVE,
-        "_Save",
-        "_Cancel"
-    );
-    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(native), TRUE);
-    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(native), "note.md");
+                    if (!g_file_test(src_p, G_FILE_TEST_EXISTS)) {
+                        void *db_data = NULL;
+                        int db_size = 0;
+                        if (note_get_image(note_id, fn, &db_data, &db_size)) {
+                            g_file_set_contents(src_p, (const char *)db_data, db_size, NULL);
+                            g_file_set_contents(dst_p, (const char *)db_data, db_size, NULL);
+                            g_free(db_data);
+                        }
+                    } else {
+                        copy_file_simple(src_p, dst_p);
+                    }
 
-    GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Markdown files (*.md)");
-    gtk_file_filter_add_pattern(filter, "*.md");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(native), filter);
+                    g_string_append_printf(out, "![image](%s)\n", fn);
+                    g_free(fn);
+                } else {
+                    g_string_append_printf(out, "%s\n", line);
+                }
+            } else {
+                g_string_append_printf(out, "%s\n", line);
+            }
+        }
+        g_strfreev(lines);
+        g_free(target_dir);
 
-    if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(native)) == GTK_RESPONSE_ACCEPT) {
-        char *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(native));
-        if (path) {
-            char *target_dir = g_path_get_dirname(path);
-            GString *out = g_string_new("");
+        GError *err = NULL;
+        g_file_set_contents(filepath, out->str, -1, &err);
+        if (err) g_error_free(err);
+        g_string_free(out, TRUE);
+    } else {
+        HPDF_Doc pdf = HPDF_New(NULL, NULL);
+        if (pdf) {
+            HPDF_Page page = HPDF_AddPage(pdf);
+            HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
+            HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
+            HPDF_Page_SetFontAndSize(page, font, 11);
+
+            float page_w = HPDF_Page_GetWidth(page);
+            float page_h = HPDF_Page_GetHeight(page);
+            float margin = 50.0f;
+            float y = page_h - margin;
+            float line_height = 14.0f;
+            float max_w = page_w - 2 * margin;
+
             char **lines = g_strsplit(text, "\n", -1);
-
             for (int i = 0; lines && lines[i]; i++) {
                 const char *line = lines[i];
                 if (g_str_has_prefix(line, "<img src=\"scythe://note_image/")) {
@@ -2227,212 +3090,422 @@ static void export_as_markdown(void) {
                     const char *fn_end = strchr(fn_start, '"');
                     if (fn_end && fn_end > fn_start) {
                         char *fn = g_strndup(fn_start, fn_end - fn_start);
-                        char src_p[512], dst_p[512];
-                        snprintf(src_p, sizeof(src_p), "%s/%s", get_note_images_dir(), fn);
-                        snprintf(dst_p, sizeof(dst_p), "%s/%s", target_dir, fn);
-                        copy_file_simple(src_p, dst_p);
+                        char img_path[512];
+                        snprintf(img_path, sizeof(img_path), "%s/%s", get_note_images_dir(), fn);
 
-                        g_string_append_printf(out, "![image](%s)\n", fn);
+                        if (!g_file_test(img_path, G_FILE_TEST_EXISTS)) {
+                            void *db_data = NULL;
+                            int db_size = 0;
+                            if (note_get_image(note_id, fn, &db_data, &db_size)) {
+                                g_file_set_contents(img_path, (const char *)db_data, db_size, NULL);
+                                g_free(db_data);
+                            }
+                        }
+
                         g_free(fn);
-                    } else {
-                        g_string_append_printf(out, "%s\n", line);
+                        if (g_file_test(img_path, G_FILE_TEST_EXISTS)) {
+                            HPDF_Image img = HPDF_LoadPngImageFromFile(pdf, img_path);
+                            if (img) {
+                                float iw = HPDF_Image_GetWidth(img);
+                                float ih = HPDF_Image_GetHeight(img);
+                                float target_w = iw > max_w ? max_w : iw;
+                                float target_h = ih * (target_w / iw);
+                                if (y - target_h < margin) {
+                                    page = HPDF_AddPage(pdf);
+                                    HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
+                                    HPDF_Page_SetFontAndSize(page, font, 11);
+                                    y = page_h - margin;
+                                }
+                                y -= target_h;
+                                HPDF_Page_DrawImage(page, img, margin, y, target_w, target_h);
+                                y -= 10.0f;
+                                continue;
+                            }
+                        }
                     }
-                } else {
-                    g_string_append_printf(out, "%s\n", line);
+                    continue;
                 }
+                if (g_str_has_prefix(line, "Captured: ")) {
+                    HPDF_Font italic_font = HPDF_GetFont(pdf, "Helvetica-Oblique", NULL);
+                    HPDF_Page_SetFontAndSize(page, italic_font, 9);
+                    y -= 12.0f;
+                    HPDF_Page_BeginText(page);
+                    HPDF_Page_TextOut(page, margin, y, line);
+                    HPDF_Page_EndText(page);
+                    HPDF_Page_SetFontAndSize(page, font, 11);
+                    continue;
+                }
+                if (y < margin + line_height) {
+                    page = HPDF_AddPage(pdf);
+                    HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
+                    HPDF_Page_SetFontAndSize(page, font, 11);
+                    y = page_h - margin;
+                }
+                y -= line_height;
+                HPDF_Page_BeginText(page);
+                HPDF_Page_TextOut(page, margin, y, line);
+                HPDF_Page_EndText(page);
             }
             g_strfreev(lines);
-            g_free(target_dir);
-
-            GError *err = NULL;
-            g_file_set_contents(path, out->str, -1, &err);
-            if (err) g_error_free(err);
-            g_string_free(out, TRUE);
-            g_free(path);
+            HPDF_SaveToFile(pdf, filepath);
+            HPDF_Free(pdf);
         }
     }
-    g_object_unref(native);
     g_free(text);
 }
 
-static void export_as_pdf(void) {
-    if (!notes_textview) return;
-    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notes_textview));
-    if (!buffer) return;
+enum {
+    EXPORT_COL_CHECK = 0,
+    EXPORT_COL_ID,
+    EXPORT_COL_TITLE,
+    NUM_EXPORT_COLS
+};
 
-    GtkTextIter s, e;
-    gtk_text_buffer_get_bounds(buffer, &s, &e);
-    char *text = gtk_text_buffer_get_text(buffer, &s, &e, TRUE);
-    if (!text || strlen(text) == 0) {
-        g_free(text);
+static void on_export_check_toggled(GtkCellRendererToggle *cell, gchar *path_str, gpointer user_data) {
+    (void)cell;
+    GtkTreeModel *model = GTK_TREE_MODEL(user_data);
+    GtkTreePath *path = gtk_tree_path_new_from_string(path_str);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gboolean val;
+        gtk_tree_model_get(model, &iter, EXPORT_COL_CHECK, &val, -1);
+        gtk_list_store_set(GTK_LIST_STORE(model), &iter, EXPORT_COL_CHECK, !val, -1);
+    }
+    gtk_tree_path_free(path);
+}
+
+static void on_export_select_all_toggled(GtkToggleButton *btn, gpointer user_data) {
+    GtkListStore *store = GTK_LIST_STORE(user_data);
+    gboolean active = gtk_toggle_button_get_active(btn);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter)) {
+        do {
+            gtk_list_store_set(store, &iter, EXPORT_COL_CHECK, active, -1);
+        } while (gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter));
+    }
+}
+
+static void show_export_notes_dialog(void) {
+    int session_id = session_get_current();
+    if (session_id == -1) return;
+
+    GPtrArray *notes = note_list_by_session(session_id);
+    if (!notes || notes->len == 0) {
+        GtkWidget *msg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "No notes available to export.");
+        gtk_dialog_run(GTK_DIALOG(msg));
+        gtk_widget_destroy(msg);
+        if (notes) g_ptr_array_free(notes, TRUE);
         return;
     }
 
-    GtkWidget *toplevel = gtk_widget_get_toplevel(notes_textview);
-    GtkWindow *parent_win = GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL;
-
-    GtkFileChooserNative *native = gtk_file_chooser_native_new(
-        "Export as PDF",
-        parent_win,
-        GTK_FILE_CHOOSER_ACTION_SAVE,
-        "_Save",
-        "_Cancel"
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Export / Manage Notes",
+        GTK_WINDOW(gtk_widget_get_toplevel(notes_textview)),
+        GTK_DIALOG_MODAL,
+        "Cancel", GTK_RESPONSE_CANCEL,
+        "📤 Export", GTK_RESPONSE_ACCEPT,
+        NULL
     );
-    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(native), TRUE);
-    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(native), "note.pdf");
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 520, 360);
 
-    GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "PDF files (*.pdf)");
-    gtk_file_filter_add_pattern(filter, "*.pdf");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(native), filter);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
 
-    if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(native)) == GTK_RESPONSE_ACCEPT) {
-        char *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(native));
-        if (path) {
-            HPDF_Doc pdf = HPDF_New(NULL, NULL);
-            if (pdf) {
-                HPDF_Page page = HPDF_AddPage(pdf);
-                HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
-                HPDF_Font font = HPDF_GetFont(pdf, "Helvetica", NULL);
-                HPDF_Page_SetFontAndSize(page, font, 11);
+    // Format Radio Buttons
+    GtkWidget *fmt_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_start(fmt_box, 8);
+    gtk_widget_set_margin_end(fmt_box, 8);
+    gtk_widget_set_margin_top(fmt_box, 6);
 
-                float page_w = HPDF_Page_GetWidth(page);
-                float page_h = HPDF_Page_GetHeight(page);
-                float margin = 50.0f;
-                float y = page_h - margin;
-                float line_height = 14.0f;
-                float max_w = page_w - 2 * margin;
+    GtkWidget *rb_md = gtk_radio_button_new_with_label(NULL, "Markdown (.md)");
+    GtkWidget *rb_pdf = gtk_radio_button_new_with_label_from_widget(GTK_RADIO_BUTTON(rb_md), "PDF (.pdf)");
+    gtk_box_pack_start(GTK_BOX(fmt_box), gtk_label_new("Format:"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(fmt_box), rb_md, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(fmt_box), rb_pdf, FALSE, FALSE, 0);
 
-                char **lines = g_strsplit(text, "\n", -1);
-                for (int i = 0; lines && lines[i]; i++) {
-                    const char *line = lines[i];
+    GtkWidget *select_all_check = gtk_check_button_new_with_label("Select All / Deselect All");
+    gtk_box_pack_end(GTK_BOX(fmt_box), select_all_check, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content_area), fmt_box, FALSE, FALSE, 0);
 
-                    /* ---- Image tag handling ---- */
-                    if (g_str_has_prefix(line, "<img src=\"scythe://note_image/")) {
-                        const char *fn_start = line + strlen("<img src=\"scythe://note_image/");
-                        const char *fn_end = strchr(fn_start, '"');
-                        if (fn_end && fn_end > fn_start) {
-                            char *fn = g_strndup(fn_start, fn_end - fn_start);
-                            char img_path[512];
-                            snprintf(img_path, sizeof(img_path), "%s/%s", get_note_images_dir(), fn);
-                            g_free(fn);
+    // List Store
+    GtkListStore *store = gtk_list_store_new(NUM_EXPORT_COLS, G_TYPE_BOOLEAN, G_TYPE_INT, G_TYPE_STRING);
+    for (guint i = 0; i < notes->len; i++) {
+        NoteInfo *info = g_ptr_array_index(notes, i);
+        GtkTreeIter iter;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+            EXPORT_COL_CHECK, FALSE,
+            EXPORT_COL_ID, info->id,
+            EXPORT_COL_TITLE, info->title ? info->title : "Untitled Note",
+            -1);
+    }
+    g_ptr_array_free(notes, TRUE);
 
-                            if (g_file_test(img_path, G_FILE_TEST_EXISTS)) {
-                                HPDF_Image img = HPDF_LoadPngImageFromFile(pdf, img_path);
-                                if (img) {
-                                    float iw = HPDF_Image_GetWidth(img);
-                                    float ih = HPDF_Image_GetHeight(img);
-                                    float target_w = iw > max_w ? max_w : iw;
-                                    float target_h = ih * (target_w / iw);
+    g_signal_connect(select_all_check, "toggled", G_CALLBACK(on_export_select_all_toggled), store);
 
-                                    if (y - target_h < margin) {
-                                        page = HPDF_AddPage(pdf);
-                                        HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
-                                        HPDF_Page_SetFontAndSize(page, font, 11);
-                                        y = page_h - margin;
-                                    }
+    GtkWidget *tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    g_object_unref(store);
 
-                                    y -= target_h;
-                                    HPDF_Page_DrawImage(page, img, margin, y, target_w, target_h);
-                                    y -= 10.0f;
-                                    continue;
-                                }
-                            }
-                        }
-                        continue;
-                    }
+    GtkCellRenderer *renderer = gtk_cell_renderer_toggle_new();
+    g_signal_connect(renderer, "toggled", G_CALLBACK(on_export_check_toggled), store);
+    GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes("", renderer, "active", EXPORT_COL_CHECK, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), col);
 
-                    if (g_str_has_prefix(line, "Captured: ")) {
-                        HPDF_Font italic_font = HPDF_GetFont(pdf, "Helvetica-Oblique", NULL);
-                        HPDF_Page_SetFontAndSize(page, italic_font, 9);
-                        y -= 12.0f;
-                        if (y < margin) {
-                            page = HPDF_AddPage(pdf);
-                            HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
-                            y = page_h - margin;
-                        }
-                        HPDF_Page_BeginText(page);
-                        HPDF_Page_MoveTextPos(page, margin, y);
-                        HPDF_Page_ShowText(page, line);
-                        HPDF_Page_EndText(page);
-                        y -= 6.0f;
-                        continue;
-                    }
+    renderer = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("Note Title", renderer, "text", EXPORT_COL_TITLE, NULL);
+    gtk_tree_view_column_set_expand(col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), col);
 
-                    /* Check if heading */
-                    gboolean is_heading = FALSE;
-                    float font_size = 11.0f;
-                    if (g_str_has_prefix(line, "### ")) { font_size = 14.0f; line += 4; is_heading = TRUE; }
-                    else if (g_str_has_prefix(line, "## ")) { font_size = 16.0f; line += 3; is_heading = TRUE; }
-                    else if (g_str_has_prefix(line, "# ")) { font_size = 20.0f; line += 2; is_heading = TRUE; }
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scrolled), tree_view);
+    gtk_box_pack_start(GTK_BOX(content_area), scrolled, TRUE, TRUE, 6);
 
-                    if (is_heading) {
-                        HPDF_Font bold_font = HPDF_GetFont(pdf, "Helvetica-Bold", NULL);
-                        HPDF_Page_SetFontAndSize(page, bold_font, font_size);
-                        line_height = font_size + 4.0f;
-                    } else {
-                        HPDF_Page_SetFontAndSize(page, font, 11);
-                        line_height = 14.0f;
-                    }
+    gtk_widget_show_all(dialog);
 
-                    y -= line_height;
-                    if (y < margin) {
-                        page = HPDF_AddPage(pdf);
-                        HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_A4, HPDF_PAGE_PORTRAIT);
-                        HPDF_Page_SetFontAndSize(page, font, 11);
-                        y = page_h - margin;
-                    }
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        gboolean is_pdf = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(rb_pdf));
+        const char *ext = is_pdf ? ".pdf" : ".md";
 
-                    /* Strip markdown formatting markers for PDF output */
-                    char *clean = g_strdup(line);
-                    GString *out = g_string_new("");
-                    const char *p = clean;
-                    while (*p) {
-                        if (p[0] == '*' && p[1] == '*') { p += 2; continue; }
-                        if (p[0] == '*') { p += 1; continue; }
-                        if (p[0] == '~' && p[1] == '~') { p += 2; continue; }
-                        if (g_str_has_prefix(p, "<u>")) { p += 3; continue; }
-                        if (g_str_has_prefix(p, "</u>")) { p += 4; continue; }
-                        g_string_append_c(out, *p);
-                        p++;
-                    }
+        // Count checked notes
+        GArray *selected_notes = g_array_new(FALSE, FALSE, sizeof(NoteInfo));
+        GtkTreeIter iter;
+        GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(tree_view));
 
-                    /* Truncate line to fit page width */
-                    HPDF_REAL tw = HPDF_Page_TextWidth(page, out->str);
-                    if (tw > max_w && out->len > 0) {
-                        while (out->len > 0 && HPDF_Page_TextWidth(page, out->str) > max_w) {
-                            g_string_truncate(out, out->len - 1);
-                        }
-                    }
-
-                    HPDF_Page_BeginText(page);
-                    HPDF_Page_MoveTextPos(page, margin, y);
-                    HPDF_Page_ShowText(page, out->str);
-                    HPDF_Page_EndText(page);
-
-                    g_string_free(out, TRUE);
-                    g_free(clean);
+        if (gtk_tree_model_get_iter_first(model, &iter)) {
+            do {
+                gboolean checked = FALSE;
+                NoteInfo info;
+                gtk_tree_model_get(model, &iter, EXPORT_COL_CHECK, &checked, EXPORT_COL_ID, &info.id, EXPORT_COL_TITLE, &info.title, -1);
+                if (checked) {
+                    g_array_append_val(selected_notes, info);
+                } else {
+                    if (info.title) g_free(info.title);
                 }
-                g_strfreev(lines);
+            } while (gtk_tree_model_iter_next(model, &iter));
+        }
 
-                HPDF_SaveToFile(pdf, path);
-                HPDF_Free(pdf);
+        // Fallback to single focused row if 0 checked
+        if (selected_notes->len == 0) {
+            GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+            if (gtk_tree_selection_get_selected(sel, &model, &iter)) {
+                NoteInfo info;
+                gtk_tree_model_get(model, &iter, EXPORT_COL_ID, &info.id, EXPORT_COL_TITLE, &info.title, -1);
+                g_array_append_val(selected_notes, info);
             }
-            g_free(path);
+        }
+
+        if (selected_notes->len == 1) {
+            NoteInfo *single = &g_array_index(selected_notes, NoteInfo, 0);
+            char default_filename[256];
+            char *clean_t = sanitize_filename(single->title ? single->title : "note");
+            snprintf(default_filename, sizeof(default_filename), "%s%s", clean_t, ext);
+            g_free(clean_t);
+
+            GtkFileChooserNative *native = gtk_file_chooser_native_new(
+                "Export Note",
+                GTK_WINDOW(gtk_widget_get_toplevel(notes_textview)),
+                GTK_FILE_CHOOSER_ACTION_SAVE,
+                "_Save", "_Cancel"
+            );
+            gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(native), TRUE);
+            gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(native), default_filename);
+
+            if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(native)) == GTK_RESPONSE_ACCEPT) {
+                char *out_path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(native));
+                if (out_path) {
+                    export_note_content_to_file(single->id, out_path, is_pdf);
+                    g_free(out_path);
+                    show_status_message("Note exported successfully!", FALSE);
+                }
+            }
+            g_object_unref(native);
+        } else if (selected_notes->len > 1) {
+            GtkFileChooserNative *native = gtk_file_chooser_native_new(
+                "Export Notes Archive",
+                GTK_WINDOW(gtk_widget_get_toplevel(notes_textview)),
+                GTK_FILE_CHOOSER_ACTION_SAVE,
+                "_Save Archive", "_Cancel"
+            );
+            gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(native), TRUE);
+            gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(native), "notes_export.zip");
+
+            if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(native)) == GTK_RESPONSE_ACCEPT) {
+                char *zip_path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(native));
+                if (zip_path) {
+                    char *tmp_dir = g_dir_make_tmp("scythe_export_XXXXXX", NULL);
+                    if (tmp_dir) {
+                        for (guint i = 0; i < selected_notes->len; i++) {
+                            NoteInfo *item = &g_array_index(selected_notes, NoteInfo, i);
+                            char *clean_t = sanitize_filename(item->title ? item->title : "note");
+                            char note_path[512];
+                            snprintf(note_path, sizeof(note_path), "%s/%s_%d%s", tmp_dir, clean_t, item->id, ext);
+                            g_free(clean_t);
+                            export_note_content_to_file(item->id, note_path, is_pdf);
+                        }
+
+                        /* SEC-001 FIX: Properly escape shell arguments to prevent command injection */
+                        char *escaped_tmp_dir = g_shell_quote(tmp_dir);
+                        char *escaped_zip_path = g_shell_quote(zip_path);
+                        char zip_cmd[2048];
+                        snprintf(zip_cmd, sizeof(zip_cmd), "cd %s && zip -j -q %s *", escaped_tmp_dir, escaped_zip_path);
+                        int res = system(zip_cmd);
+                        (void)res;
+                        g_free(escaped_tmp_dir);
+                        g_free(escaped_zip_path);
+
+                        // Cleanup temp files
+                        GDir *d = g_dir_open(tmp_dir, 0, NULL);
+                        if (d) {
+                            const char *fn;
+                            while ((fn = g_dir_read_name(d)) != NULL) {
+                                char fp[512];
+                                snprintf(fp, sizeof(fp), "%s/%s", tmp_dir, fn);
+                                remove(fp);
+                            }
+                            g_dir_close(d);
+                        }
+                        rmdir(tmp_dir);
+                        g_free(tmp_dir);
+
+                        char success_msg[256];
+                        snprintf(success_msg, sizeof(success_msg), "Exported %u notes to archive successfully!", selected_notes->len);
+                        show_status_message(success_msg, FALSE);
+                    }
+                    g_free(zip_path);
+                }
+            }
+            g_object_unref(native);
+        }
+
+        for (guint i = 0; i < selected_notes->len; i++) {
+            NoteInfo *item = &g_array_index(selected_notes, NoteInfo, i);
+            if (item->title) g_free(item->title);
+        }
+        g_array_free(selected_notes, TRUE);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+
+
+static void show_rename_note_dialog(void) {
+    if (current_note_id == -1 || !notes_textview) return;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Rename Note",
+        GTK_WINDOW(gtk_widget_get_toplevel(notes_textview)),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Rename", GTK_RESPONSE_ACCEPT,
+        NULL
+    );
+
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_margin_start(vbox, 12);
+    gtk_widget_set_margin_end(vbox, 12);
+    gtk_widget_set_margin_top(vbox, 12);
+    gtk_widget_set_margin_bottom(vbox, 12);
+
+    GtkWidget *label = gtk_label_new("Enter new note title:");
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+
+    GtkWidget *entry = gtk_entry_new();
+    char *curr_title = NULL;
+    int session_id = session_get_current();
+    if (session_id != -1) {
+        GPtrArray *notes = note_list_by_session(session_id);
+        if (notes) {
+            for (guint i = 0; i < notes->len; i++) {
+                NoteInfo *info = g_ptr_array_index(notes, i);
+                if (info && info->id == current_note_id) {
+                    curr_title = g_strdup(info->title);
+                    break;
+                }
+            }
+            g_ptr_array_free(notes, TRUE);
         }
     }
-    g_object_unref(native);
-    g_free(text);
+    gtk_entry_set_text(GTK_ENTRY(entry), curr_title ? curr_title : "");
+    g_free(curr_title);
+
+    gtk_box_pack_start(GTK_BOX(vbox), entry, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(content_area), vbox);
+    gtk_widget_show_all(vbox);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        const char *new_title = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (new_title && strlen(new_title) > 0) {
+            note_rename(current_note_id, new_title);
+            refresh_notes_list();
+            show_status_message("Note renamed", FALSE);
+        }
+    }
+    gtk_widget_destroy(dialog);
 }
 
-static void on_export_md_clicked(GtkButton *btn, gpointer data) {
-    (void)btn; (void)data;
-    export_as_markdown();
+static void delete_current_note(void) {
+    if (current_note_id == -1 || !notes_textview) return;
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(gtk_widget_get_toplevel(notes_textview)),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION,
+        GTK_BUTTONS_YES_NO,
+        "Are you sure you want to delete the selected note?"
+    );
+    gtk_window_set_title(GTK_WINDOW(dialog), "Delete Note");
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_YES) {
+        note_delete(current_note_id);
+        current_note_id = -1;
+        refresh_notes_list();
+        show_status_message("Note deleted", FALSE);
+    }
+    gtk_widget_destroy(dialog);
 }
 
-static void on_export_pdf_clicked(GtkButton *btn, gpointer data) {
-    (void)btn; (void)data;
-    export_as_pdf();
+static gboolean on_notes_combo_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
+    if (event && event->type == GDK_BUTTON_PRESS && event->button == 3) {
+        GtkWidget *menu = gtk_menu_new();
+
+        GtkWidget *mi_rename = gtk_menu_item_new_with_label("✏️ Rename Note");
+        g_signal_connect_swapped(mi_rename, "activate", G_CALLBACK(show_rename_note_dialog), NULL);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_rename);
+
+        GtkWidget *mi_delete = gtk_menu_item_new_with_label("🗑️ Delete Note");
+        g_signal_connect_swapped(mi_delete, "activate", G_CALLBACK(delete_current_note), NULL);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_delete);
+
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+
+        GtkWidget *mi_export = gtk_menu_item_new_with_label("📤 Export / Manage Notes...");
+        g_signal_connect_swapped(mi_export, "activate", G_CALLBACK(show_export_notes_dialog), NULL);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_export);
+
+        gtk_widget_show_all(menu);
+        gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void on_notes_textview_populate_popup(GtkTextView *textview, GtkWidget *popup, gpointer user_data) {
+    (void)textview; (void)user_data;
+    if (!GTK_IS_MENU_SHELL(popup)) return;
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(popup), gtk_separator_menu_item_new());
+
+    GtkWidget *mi_rename = gtk_menu_item_new_with_label("✏️ Rename Note");
+    g_signal_connect_swapped(mi_rename, "activate", G_CALLBACK(show_rename_note_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(popup), mi_rename);
+
+    GtkWidget *mi_export = gtk_menu_item_new_with_label("📤 Export / Manage Notes...");
+    g_signal_connect_swapped(mi_export, "activate", G_CALLBACK(show_export_notes_dialog), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(popup), mi_export);
+
+    gtk_widget_show_all(popup);
 }
 
 // ---- Initialization ----
@@ -2455,62 +3528,76 @@ void notes_init(GtkWidget *header_bar) {
     gtk_widget_set_margin_top(vbox, 8);
     gtk_widget_set_margin_bottom(vbox, 8);
 
-    // ---- Pin Button CSS: bright solid red when locked ----
-    GtkCssProvider *pin_css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(pin_css,
-        "#pin-toggle-button:checked,\n"
+    // ---- Pin Button CSS: bright solid red when locked / active ----
+    GtkCssProvider *pin_provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(pin_provider,
         "#pin-toggle-button.pin-active,\n"
-        "#pin-toggle-button:checked:hover,\n"
-        "#pin-toggle-button:checked:active {\n"
-        "    background-color: #dc2626;\n"
+        "#pin-toggle-button:checked,\n"
+        "button#pin-toggle-button.pin-active,\n"
+        "button#pin-toggle-button:checked {\n"
+        "    background: #e63946;\n"
+        "    background-color: #e63946;\n"
         "    background-image: none;\n"
         "    color: #ffffff;\n"
-        "    border-color: #991b1b;\n"
+        "    border: 1px solid #d62828;\n"
+        "    border-color: #d62828;\n"
         "    box-shadow: none;\n"
-        "    border-radius: 4px;\n"
-        "    min-width: 24px;\n"
-        "    min-height: 24px;\n"
         "}\n"
-        "#pin-toggle-button {\n"
-        "    min-width: 24px;\n"
-        "    min-height: 24px;\n"
-        "    padding: 2px 6px;\n"
-        "}",
-        -1, NULL);
-    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
-        GTK_STYLE_PROVIDER(pin_css), GTK_STYLE_PROVIDER_PRIORITY_USER);
-    g_object_unref(pin_css);
+        "#pin-toggle-button.pin-active:hover,\n"
+        "#pin-toggle-button:checked:hover,\n"
+        "button#pin-toggle-button.pin-active:hover,\n"
+        "button#pin-toggle-button:checked:hover {\n"
+        "    background: #d62828;\n"
+        "    background-color: #d62828;\n"
+        "    background-image: none;\n"
+        "    color: #ffffff;\n"
+        "    border: 1px solid #b71c1c;\n"
+        "    border-color: #b71c1c;\n"
+        "    box-shadow: none;\n"
+        "}\n"
+        "#pin-toggle-button.pin-active label,\n"
+        "#pin-toggle-button:checked label,\n"
+        "#pin-toggle-button.pin-active *,\n"
+        "#pin-toggle-button:checked * {\n"
+        "    color: #ffffff;\n"
+        "}\n", -1, NULL);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(pin_provider),
+        GTK_STYLE_PROVIDER_PRIORITY_USER
+    );
+    g_pin_css_provider = pin_provider;
 
-    // --- Format Toolbar (Scrollable) — B/I/U/S/H1-H3 are keyboard-only shortcuts ---
+    // --- Format Toolbar (Scrollable) ---
     GtkWidget *fmt_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(fmt_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
     gtk_widget_set_size_request(fmt_scroll, 660, 36);
 
     GtkWidget *fmt_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
 
-    GtkWidget *btn_bullet    = gtk_button_new_with_label("\342\200\242 List");
+    GtkWidget *btn_bullet    = gtk_button_new_with_label("• List");
     GtkWidget *btn_numlist   = gtk_button_new_with_label("1. List");
-    GtkWidget *btn_checklist = gtk_button_new_with_label("\342\230\221 Task");
-    GtkWidget *btn_quote     = gtk_button_new_with_label("\342\200\234 Quote");
+    GtkWidget *btn_checklist = gtk_button_new_with_label("☑ Task");
+    GtkWidget *btn_quote     = gtk_button_new_with_label("” Quote");
     GtkWidget *btn_code      = gtk_button_new_with_label("</> Code");
-    GtkWidget *btn_table     = gtk_button_new_with_label("\342\212\236 Table");
-    GtkWidget *btn_link      = gtk_button_new_with_label("\360\237\224\227 Link");
-    GtkWidget *btn_img       = gtk_button_new_with_label("\360\237\226\274 Image");
-    GtkWidget *btn_undo      = gtk_button_new_with_label("\342\206\266");
-    GtkWidget *btn_redo      = gtk_button_new_with_label("\342\206\267");
-    GtkWidget *btn_find      = gtk_button_new_with_label("\360\237\224\215");
+    GtkWidget *btn_table     = gtk_button_new_with_label("田 Table");
+    GtkWidget *btn_link      = gtk_button_new_with_label("🔗 Link");
+    GtkWidget *btn_img       = gtk_button_new_with_label("🖼 Image");
+    GtkWidget *btn_undo      = gtk_button_new_with_label("↶");
+    GtkWidget *btn_redo      = gtk_button_new_with_label("↷");
+    GtkWidget *btn_find      = gtk_button_new_with_label("🔍");
 
-    gtk_widget_set_tooltip_text(btn_bullet,    "Bullet List  ( - item )");
-    gtk_widget_set_tooltip_text(btn_numlist,   "Numbered List  ( 1. item )");
-    gtk_widget_set_tooltip_text(btn_checklist, "Task / Checkbox  ( - [ ] )");
-    gtk_widget_set_tooltip_text(btn_quote,     "Blockquote  ( > )");
-    gtk_widget_set_tooltip_text(btn_code,      "Code Block  ( ``` )");
+    gtk_widget_set_tooltip_text(btn_bullet,    "Bullet List ( - item )");
+    gtk_widget_set_tooltip_text(btn_numlist,   "Numbered List ( 1. item )");
+    gtk_widget_set_tooltip_text(btn_checklist, "Task / Checkbox ( - [ ] )");
+    gtk_widget_set_tooltip_text(btn_quote,     "Blockquote ( > )");
+    gtk_widget_set_tooltip_text(btn_code,      "Code Block ( ``` )");
     gtk_widget_set_tooltip_text(btn_table,     "Insert Table");
-    gtk_widget_set_tooltip_text(btn_link,      "Insert Link  (Ctrl+K)");
+    gtk_widget_set_tooltip_text(btn_link,      "Insert Link (Ctrl+K)");
     gtk_widget_set_tooltip_text(btn_img,       "Insert Image");
-    gtk_widget_set_tooltip_text(btn_undo,      "Undo  (Ctrl+Z)");
-    gtk_widget_set_tooltip_text(btn_redo,      "Redo  (Ctrl+Y / Ctrl+Shift+Z)");
-    gtk_widget_set_tooltip_text(btn_find,      "Find & Replace  (Ctrl+F)");
+    gtk_widget_set_tooltip_text(btn_undo,      "Undo (Ctrl+Z)");
+    gtk_widget_set_tooltip_text(btn_redo,      "Redo (Ctrl+Y / Ctrl+Shift+Z)");
+    gtk_widget_set_tooltip_text(btn_find,      "Find & Replace (Ctrl+F)");
 
     g_signal_connect(btn_bullet,    "clicked", G_CALLBACK(on_btn_bullet),    NULL);
     g_signal_connect(btn_numlist,   "clicked", G_CALLBACK(on_btn_numlist),   NULL);
@@ -2541,15 +3628,17 @@ void notes_init(GtkWidget *header_bar) {
 
     // --- Find & Replace Bar ---
     find_replace_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_margin_bottom(find_replace_bar, 4);
+
     search_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Find...");
     replace_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Find...");
     gtk_entry_set_placeholder_text(GTK_ENTRY(replace_entry), "Replace with...");
 
     GtkWidget *btn_find_next = gtk_button_new_with_label("Find");
     GtkWidget *btn_replace = gtk_button_new_with_label("Replace");
     GtkWidget *btn_replace_all = gtk_button_new_with_label("All");
-    GtkWidget *btn_close_find = gtk_button_new_with_label("\342\234\225");
+    GtkWidget *btn_close_find = gtk_button_new_with_label("×");
 
     g_signal_connect(btn_find_next, "clicked", G_CALLBACK(on_find_next_clicked), NULL);
     g_signal_connect(search_entry, "activate", G_CALLBACK(on_find_next_clicked), NULL);
@@ -2569,7 +3658,7 @@ void notes_init(GtkWidget *header_bar) {
     // --- Single Pane Editor ---
     GtkWidget *scrolled_window = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled_window),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_size_request(scrolled_window, 670, 370);
     g_scrolled_window = scrolled_window;
 
@@ -2586,6 +3675,7 @@ void notes_init(GtkWidget *header_bar) {
     g_signal_connect(buffer, "changed", G_CALLBACK(on_buffer_changed_render), NULL);
     g_signal_connect(buffer, "notify::cursor-position", G_CALLBACK(on_cursor_moved), NULL);
     g_signal_connect(notes_textview, "key-press-event", G_CALLBACK(on_editor_key_press), NULL);
+    g_signal_connect(notes_textview, "populate-popup", G_CALLBACK(on_notes_textview_populate_popup), NULL);
     // Clickable links + image deactivation on text area click
     gtk_widget_add_events(notes_textview, GDK_BUTTON_RELEASE_MASK);
     g_signal_connect(notes_textview, "button-release-event", G_CALLBACK(on_textview_button_release), NULL);
@@ -2601,7 +3691,10 @@ void notes_init(GtkWidget *header_bar) {
 
     notes_combo = gtk_combo_box_text_new();
     gtk_widget_set_size_request(notes_combo, 150, -1);
+    gtk_widget_set_tooltip_text(notes_combo, "Select Note (Right-click for options)");
+    gtk_widget_add_events(notes_combo, GDK_BUTTON_PRESS_MASK);
     g_signal_connect(notes_combo, "changed", G_CALLBACK(on_note_selected), NULL);
+    g_signal_connect(notes_combo, "button-press-event", G_CALLBACK(on_notes_combo_button_press), NULL);
 
     GtkWidget *snip_btn = gtk_button_new_with_label("\360\237\223\267 Snip");
     g_signal_connect(snip_btn, "clicked", G_CALLBACK(on_snip_clicked), NULL);
@@ -2610,31 +3703,23 @@ void notes_init(GtkWidget *header_bar) {
     g_signal_connect(timestamp_btn, "clicked", G_CALLBACK(on_timestamp_clicked), NULL);
 
     /* Pin toggle: dot (●) — red = pinned, grey = unpinned. Color managed via CSS class. */
-    GtkWidget *pin_toggle_btn = gtk_toggle_button_new_with_label("\342\227\217");
+    GtkWidget *pin_toggle_btn = gtk_toggle_button_new_with_label("●");
     gtk_widget_set_name(pin_toggle_btn, "pin-toggle-button");
     g_pin_toggle_btn = pin_toggle_btn;
-    gtk_widget_set_tooltip_text(pin_toggle_btn, "Pin: Keep Notes panel open (red = pinned)");
+    gtk_widget_set_tooltip_text(pin_toggle_btn, "Pin: Keep Notes panel open");
+    if (g_pin_css_provider) {
+        gtk_style_context_add_provider(
+            gtk_widget_get_style_context(pin_toggle_btn),
+            GTK_STYLE_PROVIDER(g_pin_css_provider),
+            GTK_STYLE_PROVIDER_PRIORITY_USER
+        );
+    }
     g_signal_connect(pin_toggle_btn, "toggled", G_CALLBACK(on_pin_toggled), NULL);
 
-    /* Export button with popover menu */
-    GtkWidget *export_btn = gtk_menu_button_new();
-    gtk_button_set_label(GTK_BUTTON(export_btn), "\360\237\223\244 Export");
-    gtk_widget_set_tooltip_text(export_btn, "Export note as PDF or Markdown");
-    GtkWidget *export_popover = gtk_popover_new(export_btn);
-    GtkWidget *export_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
-    gtk_widget_set_margin_start(export_box, 6);
-    gtk_widget_set_margin_end(export_box, 6);
-    gtk_widget_set_margin_top(export_box, 6);
-    gtk_widget_set_margin_bottom(export_box, 6);
-    GtkWidget *exp_md = gtk_button_new_with_label("Export as .md");
-    GtkWidget *exp_pdf = gtk_button_new_with_label("Export as PDF");
-    g_signal_connect(exp_md, "clicked", G_CALLBACK(on_export_md_clicked), NULL);
-    g_signal_connect(exp_pdf, "clicked", G_CALLBACK(on_export_pdf_clicked), NULL);
-    gtk_box_pack_start(GTK_BOX(export_box), exp_md, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(export_box), exp_pdf, FALSE, FALSE, 0);
-    gtk_container_add(GTK_CONTAINER(export_popover), export_box);
-    gtk_widget_show_all(export_box);
-    gtk_menu_button_set_popover(GTK_MENU_BUTTON(export_btn), export_popover);
+    /* Export button: opens unified export dialog */
+    GtkWidget *export_btn = gtk_button_new_with_label("\360\237\223\244 Export");
+    gtk_widget_set_tooltip_text(export_btn, "Export or manage notes");
+    g_signal_connect_swapped(export_btn, "clicked", G_CALLBACK(show_export_notes_dialog), NULL);
 
     /* Resize grip at bottom-left: dragging expands the notes popover */
     GtkWidget *resize_grip = gtk_event_box_new();

@@ -14,6 +14,9 @@
 #include <gio/gio.h>
 #include "conversation.h"
 
+#define SCYTHE_VERSION "2.5"
+#define SCYTHE_DEVELOPER "KruInfosec"
+
 // Global variable to store the application's starting directory
 extern gchar *app_directory;
 

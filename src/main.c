@@ -27,6 +27,7 @@ static gboolean g_logging_enabled = TRUE;
 GtkWidget *ai_webview = NULL;
 GtkWidget *ai_scrolled_window = NULL;
 GtkWidget *ai_entry_widget = NULL;  // For auto-focus on toggle (global)
+static GtkWidget *g_session_btn = NULL; // Session header bar button for label updates
 
 // Callback for WebView load status
 static void on_webview_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event, gpointer user_data) {
@@ -35,6 +36,322 @@ static void on_webview_load_changed(WebKitWebView *web_view, WebKitLoadEvent loa
         // This prevents the "darkening" effect on startup
         // apply_ui_theme();  // REMOVED - colors already correct in HTML
     }
+}
+
+
+static void update_session_btn_label(void) {
+    if (!g_session_btn) return;
+    int sid = session_get_current();
+    if (sid != -1) {
+        char *name = session_get_name(sid);
+        if (name && strlen(name) > 0) {
+            char label[128];
+            snprintf(label, sizeof(label), "Session: %s", name);
+            gtk_button_set_label(GTK_BUTTON(g_session_btn), label);
+        } else {
+            gtk_button_set_label(GTK_BUTTON(g_session_btn), "Session");
+        }
+        if (name) g_free(name);
+    } else {
+        gtk_button_set_label(GTK_BUTTON(g_session_btn), "Session");
+    }
+}
+
+enum {
+    COL_SESSION_CHECK = 0,
+    COL_SESSION_ID,
+    COL_SESSION_NAME,
+    COL_SESSION_DATE,
+    COL_SESSION_NOTES,
+    NUM_SESSION_COLS
+};
+
+static void on_session_check_toggled(GtkCellRendererToggle *cell, gchar *path_str, gpointer user_data) {
+    (void)cell;
+    GtkTreeModel *model = GTK_TREE_MODEL(user_data);
+    GtkTreePath *path = gtk_tree_path_new_from_string(path_str);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gboolean val;
+        gtk_tree_model_get(model, &iter, COL_SESSION_CHECK, &val, -1);
+        gtk_list_store_set(GTK_LIST_STORE(model), &iter, COL_SESSION_CHECK, !val, -1);
+    }
+    gtk_tree_path_free(path);
+}
+
+static void on_select_all_sessions_toggled(GtkToggleButton *btn, gpointer user_data) {
+    GtkListStore *store = GTK_LIST_STORE(user_data);
+    gboolean active = gtk_toggle_button_get_active(btn);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter)) {
+        do {
+            gtk_list_store_set(store, &iter, COL_SESSION_CHECK, active, -1);
+        } while (gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter));
+    }
+}
+
+static void populate_session_store(GtkListStore *store) {
+    gtk_list_store_clear(store);
+    GPtrArray *sessions = session_list_saved();
+    if (!sessions) return;
+    for (guint i = 0; i < sessions->len; i++) {
+        SavedSessionInfo *info = g_ptr_array_index(sessions, i);
+        int note_count = session_note_count(info->id);
+        GtkTreeIter iter;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+            COL_SESSION_CHECK, FALSE,
+            COL_SESSION_ID, info->id,
+            COL_SESSION_NAME, info->name ? info->name : "Untitled Session",
+            COL_SESSION_DATE, info->start_time ? info->start_time : "",
+            COL_SESSION_NOTES, note_count,
+            -1);
+    }
+    g_ptr_array_free(sessions, TRUE);
+}
+
+static void load_selected_session(GtkTreeView *tree_view, GtkWidget *dialog) {
+    GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+    GtkTreeIter iter;
+    GArray *checked_ids = g_array_new(FALSE, FALSE, sizeof(int));
+
+    if (gtk_tree_model_get_iter_first(model, &iter)) {
+        do {
+            gboolean checked = FALSE;
+            int sid = -1;
+            gtk_tree_model_get(model, &iter, COL_SESSION_CHECK, &checked, COL_SESSION_ID, &sid, -1);
+            if (checked && sid != -1) {
+                g_array_append_val(checked_ids, sid);
+            }
+        } while (gtk_tree_model_iter_next(model, &iter));
+    }
+
+    int target_id = -1;
+    if (checked_ids->len > 0) {
+        target_id = g_array_index(checked_ids, int, 0);
+    } else {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
+        if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+            gtk_tree_model_get(model, &iter, COL_SESSION_ID, &target_id, -1);
+        }
+    }
+
+    if (target_id == -1) {
+        g_array_free(checked_ids, TRUE);
+        return;
+    }
+
+    session_set_current(target_id);
+    notes_refresh();
+
+    // Refresh AI conversation for loaded session
+    if (ai_webview) {
+        if (current_conversation) {
+            conversation_free(current_conversation);
+            current_conversation = NULL;
+        }
+        GPtrArray *convs = conversation_list_by_db_session(target_id);
+        if (convs && convs->len > 0) {
+            Conversation *last = g_ptr_array_index(convs, 0);
+            current_conversation = conversation_load(last->session_id);
+            if (current_conversation) {
+                webview_load_conversation(ai_webview, current_conversation->messages);
+            }
+        } else {
+            const char *model_name = (current_settings.groq_model && current_settings.groq_model[0]) ? current_settings.groq_model : "llama-3.3-70b-versatile";
+            current_conversation = conversation_new("New Conversation", model_name, FALSE);
+            webview_clear(ai_webview);
+        }
+        if (convs) g_ptr_array_free(convs, TRUE);
+    }
+
+    update_session_btn_label();
+
+    char *name = session_get_name(target_id);
+    char msg_str[256];
+    if (checked_ids->len > 1) {
+        snprintf(msg_str, sizeof(msg_str), "Loaded %u sessions into workspace successfully!", checked_ids->len);
+    } else {
+        snprintf(msg_str, sizeof(msg_str), "Session '%s' loaded successfully!", name ? name : "Selected Session");
+    }
+    if (name) g_free(name);
+    g_array_free(checked_ids, TRUE);
+
+    gtk_dialog_response(GTK_DIALOG(dialog), GTK_RESPONSE_DELETE_EVENT);
+
+    GtkWidget *msg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg_str);
+    gtk_dialog_run(GTK_DIALOG(msg));
+    gtk_widget_destroy(msg);
+}
+
+static void on_session_rename_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    GtkTreeView *tv = GTK_TREE_VIEW(user_data);
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(tv);
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(sel, &model, &iter)) return;
+
+    int sid;
+    char *old_name = NULL;
+    gtk_tree_model_get(model, &iter, COL_SESSION_ID, &sid, COL_SESSION_NAME, &old_name, -1);
+
+    GtkWidget *rename_dialog = gtk_dialog_new_with_buttons(
+        "Rename Session",
+        GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(tv))),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Rename", GTK_RESPONSE_ACCEPT,
+        NULL
+    );
+    GtkWidget *ca = gtk_dialog_get_content_area(GTK_DIALOG(rename_dialog));
+    GtkWidget *ebox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_margin_start(ebox, 12);
+    gtk_widget_set_margin_end(ebox, 12);
+    gtk_widget_set_margin_top(ebox, 12);
+    gtk_widget_set_margin_bottom(ebox, 12);
+
+    GtkWidget *lbl = gtk_label_new("Enter new session name:");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(ebox), lbl, FALSE, FALSE, 0);
+
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entry), old_name ? old_name : "");
+    gtk_box_pack_start(GTK_BOX(ebox), entry, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(ca), ebox);
+    gtk_widget_show_all(ebox);
+
+    if (gtk_dialog_run(GTK_DIALOG(rename_dialog)) == GTK_RESPONSE_ACCEPT) {
+        const char *new_name = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (new_name && strlen(new_name) > 0) {
+            session_rename(sid, new_name);
+            gtk_list_store_set(GTK_LIST_STORE(model), &iter, COL_SESSION_NAME, new_name, -1);
+            update_session_btn_label();
+        }
+    }
+    gtk_widget_destroy(rename_dialog);
+    g_free(old_name);
+}
+
+static void on_session_delete_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    GtkTreeView *tv = GTK_TREE_VIEW(user_data);
+    GtkTreeModel *model = gtk_tree_view_get_model(tv);
+    GtkListStore *store = GTK_LIST_STORE(model);
+
+    // Count checked sessions
+    int checked_count = 0;
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter_first(model, &iter)) {
+        do {
+            gboolean checked = FALSE;
+            gtk_tree_model_get(model, &iter, COL_SESSION_CHECK, &checked, -1);
+            if (checked) checked_count++;
+        } while (gtk_tree_model_iter_next(model, &iter));
+    }
+
+    if (checked_count > 0) {
+        char confirm_msg[256];
+        snprintf(confirm_msg, sizeof(confirm_msg),
+            "Are you sure you want to delete %d selected session(s)?\n\nThis will permanently remove all associated notes, chat history, and terminal logs.",
+            checked_count);
+
+        GtkWidget *confirm = gtk_message_dialog_new(
+            GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(tv))),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_YES_NO,
+            "%s", confirm_msg
+        );
+        gtk_window_set_title(GTK_WINDOW(confirm), "Delete Sessions");
+
+        if (gtk_dialog_run(GTK_DIALOG(confirm)) == GTK_RESPONSE_YES) {
+            gboolean deleted_current = FALSE;
+            int cur_sid = session_get_current();
+            gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+            while (valid) {
+                gboolean checked = FALSE;
+                int sid = -1;
+                gtk_tree_model_get(model, &iter, COL_SESSION_CHECK, &checked, COL_SESSION_ID, &sid, -1);
+                if (checked && sid != -1) {
+                    if (sid == cur_sid) {
+                        deleted_current = TRUE;
+                    }
+                    session_delete(sid);
+                    valid = gtk_list_store_remove(store, &iter);
+                } else {
+                    valid = gtk_tree_model_iter_next(model, &iter);
+                }
+            }
+            if (deleted_current) {
+                session_set_current(-1);
+                notes_reset_state();
+                GtkWidget *alert = gtk_message_dialog_new(
+                    GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(tv))),
+                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                    GTK_MESSAGE_WARNING,
+                    GTK_BUTTONS_OK,
+                    "Current Session Data Deleted\n\nYour active session data has been deleted and cannot be saved. Please load or create a new session."
+                );
+                gtk_window_set_title(GTK_WINDOW(alert), "Current Session Data Deleted");
+                gtk_dialog_run(GTK_DIALOG(alert));
+                gtk_widget_destroy(alert);
+            }
+            update_session_btn_label();
+        }
+        gtk_widget_destroy(confirm);
+    } else {
+        // Single focused row fallback
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(tv);
+        if (!gtk_tree_selection_get_selected(sel, &model, &iter)) return;
+
+        int sid;
+        char *sname = NULL;
+        gtk_tree_model_get(model, &iter, COL_SESSION_ID, &sid, COL_SESSION_NAME, &sname, -1);
+
+        char confirm_msg[256];
+        snprintf(confirm_msg, sizeof(confirm_msg),
+            "Are you sure you want to delete session '%s'?\n\nThis will permanently remove all associated notes, chat history, and terminal logs.",
+            sname ? sname : "Selected Session");
+        g_free(sname);
+
+        GtkWidget *confirm = gtk_message_dialog_new(
+            GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(tv))),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_YES_NO,
+            "%s", confirm_msg
+        );
+        gtk_window_set_title(GTK_WINDOW(confirm), "Delete Session");
+
+        if (gtk_dialog_run(GTK_DIALOG(confirm)) == GTK_RESPONSE_YES) {
+            int cur_sid = session_get_current();
+            session_delete(sid);
+            gtk_list_store_remove(store, &iter);
+            if (sid == cur_sid) {
+                session_set_current(-1);
+                notes_reset_state();
+                GtkWidget *alert = gtk_message_dialog_new(
+                    GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(tv))),
+                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                    GTK_MESSAGE_WARNING,
+                    GTK_BUTTONS_OK,
+                    "Current Session Data Deleted\n\nYour active session data has been deleted and cannot be saved. Please load or create a new session."
+                );
+                gtk_window_set_title(GTK_WINDOW(alert), "Current Session Data Deleted");
+                gtk_dialog_run(GTK_DIALOG(alert));
+                gtk_widget_destroy(alert);
+            }
+            update_session_btn_label();
+        }
+        gtk_widget_destroy(confirm);
+    }
+}
+
+static void on_session_row_activated(GtkTreeView *tv, GtkTreePath *path, GtkTreeViewColumn *col, gpointer user_data) {
+    (void)path; (void)col; (void)user_data;
+    GtkWidget *dlg = GTK_WIDGET(g_object_get_data(G_OBJECT(tv), "parent-dialog"));
+    load_selected_session(tv, dlg);
 }
 
 // Function to handle session actions
@@ -67,12 +384,17 @@ static void session_action(GtkWidget *widget, gpointer data) {
             const char *name = gtk_entry_get_text(GTK_ENTRY(entry));
             if (name && strlen(name) > 0) {
                 int session_id = session_get_current();
-                if (session_id != -1) {
-                    if (session_save(session_id, name)) {
-                        GtkWidget *msg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "Session saved successfully!");
-                        gtk_dialog_run(GTK_DIALOG(msg));
-                        gtk_widget_destroy(msg);
-                    }
+                if (session_id != -1 && session_save(session_id, name)) {
+                    update_session_btn_label();
+                    GtkWidget *msg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "Session saved successfully!");
+                    gtk_dialog_run(GTK_DIALOG(msg));
+                    gtk_widget_destroy(msg);
+                } else {
+                    GtkWidget *msg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING, GTK_BUTTONS_OK,
+                        "Current Session Data Deleted\n\nSession data could not be saved because the session was deleted or does not exist.");
+                    gtk_window_set_title(GTK_WINDOW(msg), "Current Session Data Deleted");
+                    gtk_dialog_run(GTK_DIALOG(msg));
+                    gtk_widget_destroy(msg);
                 }
             }
         }
@@ -86,73 +408,103 @@ static void session_action(GtkWidget *widget, gpointer data) {
             if (sessions) g_ptr_array_free(sessions, TRUE);
             return;
         }
+        g_ptr_array_free(sessions, TRUE);
 
         GtkWidget *dialog = gtk_dialog_new_with_buttons(
-            "Load Session",
+            "Manage Sessions",
             GTK_WINDOW(gtk_widget_get_toplevel(widget)),
             GTK_DIALOG_MODAL,
             "Cancel", GTK_RESPONSE_CANCEL,
-            "Load", GTK_RESPONSE_ACCEPT,
             NULL
         );
-        
+        gtk_window_set_default_size(GTK_WINDOW(dialog), 550, 350);
+
         GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-        GtkWidget *label = gtk_label_new("Select a saved session:");
-        gtk_box_pack_start(GTK_BOX(content_area), label, FALSE, FALSE, 5);
 
-        GtkWidget *combo = gtk_combo_box_text_new();
-        for (guint i = 0; i < sessions->len; i++) {
-            SavedSessionInfo *info = g_ptr_array_index(sessions, i);
-            char id_str[32];
-            snprintf(id_str, sizeof(id_str), "%d", info->id);
-            char display_str[256];
-            snprintf(display_str, sizeof(display_str), "%s (%s)", info->name, info->start_time);
-            gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), id_str, display_str);
-        }
-        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
-        gtk_box_pack_start(GTK_BOX(content_area), combo, FALSE, FALSE, 5);
+        // Top toolbar in content area
+        GtkWidget *top_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_widget_set_margin_start(top_box, 8);
+        gtk_widget_set_margin_end(top_box, 8);
+        gtk_widget_set_margin_top(top_box, 6);
+        GtkWidget *select_all_check = gtk_check_button_new_with_label("Select All / Deselect All");
+        gtk_box_pack_start(GTK_BOX(top_box), select_all_check, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(content_area), top_box, FALSE, FALSE, 0);
+
+        // TreeView with ListStore
+        GtkListStore *store = gtk_list_store_new(NUM_SESSION_COLS,
+            G_TYPE_BOOLEAN, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
+        populate_session_store(store);
+
+        g_signal_connect(select_all_check, "toggled", G_CALLBACK(on_select_all_sessions_toggled), store);
+
+        GtkWidget *tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+        g_object_unref(store);
+
+        GtkCellRenderer *renderer;
+        GtkTreeViewColumn *col;
+
+        // Checkbox column
+        renderer = gtk_cell_renderer_toggle_new();
+        g_signal_connect(renderer, "toggled", G_CALLBACK(on_session_check_toggled), store);
+        col = gtk_tree_view_column_new_with_attributes("", renderer, "active", COL_SESSION_CHECK, NULL);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), col);
+
+        renderer = gtk_cell_renderer_text_new();
+        col = gtk_tree_view_column_new_with_attributes("Name", renderer, "text", COL_SESSION_NAME, NULL);
+        gtk_tree_view_column_set_expand(col, TRUE);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), col);
+
+        renderer = gtk_cell_renderer_text_new();
+        col = gtk_tree_view_column_new_with_attributes("Date", renderer, "text", COL_SESSION_DATE, NULL);
+        gtk_tree_view_column_set_min_width(col, 160);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), col);
+
+        renderer = gtk_cell_renderer_text_new();
+        col = gtk_tree_view_column_new_with_attributes("Notes", renderer, "text", COL_SESSION_NOTES, NULL);
+        gtk_tree_view_column_set_min_width(col, 60);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), col);
+
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+        gtk_tree_selection_set_mode(selection, GTK_SELECTION_SINGLE);
+
+        GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+        gtk_container_add(GTK_CONTAINER(scrolled), tree_view);
+        gtk_box_pack_start(GTK_BOX(content_area), scrolled, TRUE, TRUE, 5);
+
+        // Action buttons
+        GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_widget_set_margin_start(btn_box, 8);
+        gtk_widget_set_margin_end(btn_box, 8);
+        gtk_widget_set_margin_bottom(btn_box, 8);
+
+        GtkWidget *load_btn = gtk_button_new_with_label("📂 Load");
+        GtkWidget *rename_btn = gtk_button_new_with_label("✏️ Rename");
+        GtkWidget *delete_btn = gtk_button_new_with_label("🗑️ Delete");
+
+        gtk_box_pack_start(GTK_BOX(btn_box), load_btn, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(btn_box), rename_btn, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(btn_box), delete_btn, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(content_area), btn_box, FALSE, FALSE, 0);
+
         gtk_widget_show_all(dialog);
-        
-        if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
-            const char *active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
-            if (active_id) {
-                int target_id = atoi(active_id);
-                session_set_current(target_id);
-                notes_refresh();
 
-                // Refresh AI conversation for loaded session
-                if (ai_webview) {
-                    if (current_conversation) {
-                        conversation_free(current_conversation);
-                        current_conversation = NULL;
-                    }
-                    GPtrArray *convs = conversation_list_by_db_session(target_id);
-                    if (convs && convs->len > 0) {
-                        Conversation *last = g_ptr_array_index(convs, 0);
-                        current_conversation = conversation_load(last->session_id);
-                        if (current_conversation) {
-                            webview_load_conversation(ai_webview, current_conversation->messages);
-                        }
-                    } else {
-                        const char *model = (current_settings.groq_model && current_settings.groq_model[0]) ? current_settings.groq_model : "llama-3.3-70b-versatile";
-                        current_conversation = conversation_new("New Conversation", model, FALSE);
-                        webview_clear(ai_webview);
-                    }
-                    if (convs) g_ptr_array_free(convs, TRUE);
-                }
+        // --- Signal handlers ---
+        // Load button
+        g_signal_connect_swapped(load_btn, "clicked", G_CALLBACK(load_selected_session), tree_view);
+        g_object_set_data(G_OBJECT(tree_view), "parent-dialog", dialog);
 
-                char *name = session_get_name(target_id);
-                char msg_str[256];
-                snprintf(msg_str, sizeof(msg_str), "Session '%s' loaded successfully!", name ? name : "Selected Session");
-                if (name) g_free(name);
-                
-                GtkWidget *msg = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg_str);
-                gtk_dialog_run(GTK_DIALOG(msg));
-                gtk_widget_destroy(msg);
-            }
-        }
+        // Rename button
+        g_signal_connect(rename_btn, "clicked", G_CALLBACK(on_session_rename_clicked), tree_view);
+
+        // Delete button
+        g_signal_connect(delete_btn, "clicked", G_CALLBACK(on_session_delete_clicked), tree_view);
+
+        // Double-click to load
+        g_signal_connect(tree_view, "row-activated", G_CALLBACK(on_session_row_activated), NULL);
+
+        gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
-        g_ptr_array_free(sessions, TRUE);
     }
 }
 
@@ -919,6 +1271,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
 
     // Create the Session button with its dropdown menu
     GtkWidget *session_btn = gtk_button_new_with_label("Session");
+    g_session_btn = session_btn;
     g_object_set_data(G_OBJECT(session_btn), "notebook", notebook);
     g_object_set_data(G_OBJECT(session_btn), "window", window);
     const char *session_items[] = {"Save Session", "Load Session"};

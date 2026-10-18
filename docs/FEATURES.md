@@ -239,6 +239,36 @@ sudo apt autoremove -y
 
 ---
 
+## Notes Editor
+
+### Integrated Markdown Notes
+Scythe features a built-in interactive notes panel with a rich Markdown editor, allowing security professionals to document findings, structure commands, and prepare reports side-by-side with active shell terminals.
+
+**Features**:
+- **Rich Syntax Highlighting**: Real-time rendering of headings (`#`), lists (`-`), task lists (`- [ ]`), blockquotes (`>`), links (`[title](url)`), and tables.
+- **Dynamic Syntax Auto-Hiding**: Raw Markdown formatting tokens (like `**`, `*`, `~~`, and `<u>`) are hidden on inactive lines to present a clean reading view, and reappear automatically when editing a line.
+- **Auto-Focus**: Opening the Notes editor instantly focuses the cursor in the editor so you can start typing immediately without clicking.
+- **Smooth 1-Click Switching**: Switching focus from Notes back to the Terminal is instantaneous—clicking the terminal once closes the unpinned notes panel and positions the shell cursor on that single click.
+
+### Screen Snip Tool
+Capture and insert screenshots directly into notes.
+
+**Features**:
+- **System-Wide Capture (`Ctrl+Alt+S`)**: Trigger screen capture globally at any time when Scythe is running in the background or minimized.
+- **Dynamic Toolbar & Layout**: Select any image in the editor to activate a dynamic alignment toolbar supporting Left, Center, and Right margin presets.
+- **Line Auto-Hiding**: Internal raw image syntax lines (`<img src=...>` and `Captured: ` timestamps) dynamically hide unless the image is selected or being edited.
+- **System Image Viewer**: Double-clicking an image in the editor opens it instantly in your OS's default system image viewer.
+
+### Portable Export
+Save and share your notes.
+
+**Features**:
+- **Markdown Export (`.md`)**: Copies note text, outputs images into the target export directory, and rewrites relative links for full document portability.
+- **PDF Export (`.pdf`)**: Paginated export utilizing LibHaru (`libhpdf`) that automatically scales and embeds PNG screenshots alongside note text.
+- **Native OS Dialogs**: Powered by `GTK_USE_PORTAL=1` and `GtkFileChooserNative`, all file pickers and export dialogs use your desktop environment's native system dialogs and themes.
+
+---
+
 ## Customization
 
 ### Full Theme Control
@@ -379,6 +409,21 @@ Customize all keybindings.
 **Panel Behavior**:
 - **Opening**: AI input receives focus automatically → Start typing immediately
 - **Closing**: Terminal receives focus automatically → Continue where you left off
+
+#### Notes Editor
+| Action | Shortcut |
+|--------|----------|
+| Toggle Notes Panel | `Alt+N` |
+| Toggle Notes Pin | `Alt+P` |
+| Snip Tool (Capture) | `Ctrl+Alt+S` |
+| Format Text Bold | `Ctrl+B` |
+| Format Text Italic | `Ctrl+I` |
+| Format Text Underline | `Ctrl+U` |
+| Format Text Strikethrough | `Ctrl+Shift+X` |
+| Save Current Note | `Ctrl+S` |
+| Undo Last Change | `Ctrl+Z` |
+| Redo Last Change | `Ctrl+Y` / `Ctrl+Shift+Z` |
+| Close Popover (unpinned)| `Escape` |
 
 #### Opacity Control
 | Action | Shortcut |

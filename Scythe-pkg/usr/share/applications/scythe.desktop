@@ -2,7 +2,7 @@
 Version=1.0
 Name=Scythe
 Comment=Vulnerability & Security Testing Terminal
-Exec=scythe-fixed
+Exec=scythe
 Icon=scythe
 Terminal=false
 Type=Application

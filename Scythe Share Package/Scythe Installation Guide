@@ -1,0 +1,90 @@
+# Scythe Installation Guide
+
+This document contains instructions to help you install and configure **Scythe** on their PC.
+
+---
+
+## 📋 Prerequisites
+- **Operating System:** GNU/Linux (Ubuntu 22.04+, Debian 12+, Kali Linux, or similar Debian-based distributions).
+- **Architecture:** `amd64` (64-bit Intel/AMD).
+
+---
+
+## 📂 Files Present
+
+1. **`scythe.deb`** — The prebuilt Debian package containing the application binary, deskop launcher icon, and the built-in vulnerability scanning scripts (`CVE-Lookup.py` and `extsec.py`).
+2. **`Modelfile`** — The configuration containing the AI core ("Dama") system instructions. This dictates how the AI behaves and how it formats complex outputs like interactive Mermaid diagrams.
+3. **`install.sh`** — The updated installation helper script that automates package list updating, runtime library installation, python dependency handling, and package installation.
+4. **`README.md`** *(Optional)* — Useful reference for application features, customization tabs, settings, and keyboard shortcuts.
+
+---
+
+## ⚙️ Installation Instructions
+
+Follow these steps to set up Scythe:
+
+### 1. Extract the Files
+Extract the files into a dedicated directory (e.g., `~/Scythe`) in your home folder:
+```bash
+mkdir -p ~/Scythe
+# Move the received zip file or individual files to ~/Scythe and extract if needed
+cd ~/Scythe
+```
+
+### 2. Make the Installer Executable
+Mark the installation helper script as executable:
+```bash
+chmod +x install.sh
+```
+
+### 3. Run the Installer
+Execute the installation script. This will update package repositories, install all GUI/Web/Terminal libraries, configure scanning tools, and install the `.deb` package:
+```bash
+./install.sh
+```
+*Note: This script installs Python dependencies via the system package manager (e.g., `python3-requests`, `python3-colorama`, etc.) to prevent PEP 668 PEP conflicts ("externally-managed-environment" errors).*
+
+---
+
+## 🚀 Running and Configuring Scythe
+
+### Launching the Application
+Since Scythe loads its AI identity and formatting guidelines from the `Modelfile` in the **current working directory** at runtime, you should always start Scythe from the directory where `Modelfile` is located:
+```bash
+cd ~/Scythe
+scythe
+```
+*(If run from outside this directory, Scythe will fallback to a default generic AI prompt instead of the specialized cybersecurity workbench helper).*
+
+---
+
+## 🤖 Configuring the AI Core
+Scythe supports both local and cloud-based Large Language Models (LLMs) to guide your tests:
+
+### Option A: Local AI Core (Ollama)
+If you want to run LLMs completely offline:
+1. Install Ollama:
+   ```bash
+   curl -fsSL https://ollama.com/install.sh | sh
+   ```
+2. Pull the default LLaMA 3 model:
+   ```bash
+   ollama pull llama3
+   ```
+3. Open Scythe, click **Customise** (or press `Ctrl+Shift+P`), navigate to the **AI Settings** tab, select **Ollama** as the provider, and choose `llama3`.
+
+### Option B: Cloud AI Core (Groq API - Faster & Recommended)
+If you prefer cloud execution with zero local hardware load:
+1. Obtain an API key from the [Groq Console](https://console.groq.com).
+2. Open Scythe, click **Customise** (or press `Ctrl+Shift+P`), navigate to the **AI Settings** tab.
+3. Choose **Groq** as the provider, paste your API Key, and select your preferred model (e.g., `llama-3.3-70b-versatile`).
+4. Save the settings.
+
+---
+
+## 🛠️ Included Automated Tools
+Scythe includes built-in penetration testing helpers that are fully integrated into the terminal's **Automate** tab:
+* **Common Vulnerabilities and Exposures Search:** `CVE-Lookup`
+* **External Web Reconnaissance Tool:** `EXTSEC`
+
+*(These scripts are automatically installed to `/usr/share/scythe/` and are ready for 1-click execution in active terminal tabs).*

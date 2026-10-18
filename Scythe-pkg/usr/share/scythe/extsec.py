@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
 External Security Assessment Tool
 A comprehensive security scanning tool for web domains

@@ -203,27 +203,29 @@ void automate_action(GtkWidget *widget, gpointer data) {
     gchar *script_path = NULL;
     gchar *command = NULL;
 
+    const char *py_bin = (access("/usr/bin/python3", X_OK) == 0) ? "/usr/bin/python3" : "python3";
+
     if (g_strcmp0(action, "EXTSEC") == 0) {
         script_path = g_build_filename("/usr/share/scythe", "extsec.py", NULL);
         if (access(script_path, F_OK) == -1) {
             g_free(script_path);
             script_path = g_build_filename(app_directory, "extsec.py", NULL);
         }
-        command = g_strdup_printf("python3 \"%s\"\n", script_path);
+        command = g_strdup_printf("%s \"%s\"\n", py_bin, script_path);
     } else if (g_strcmp0(action, "CVE-Lookup") == 0) {
         script_path = g_build_filename("/usr/share/scythe", "CVE-Lookup.py", NULL);
         if (access(script_path, F_OK) == -1) {
             g_free(script_path);
             script_path = g_build_filename(app_directory, "CVE-Lookup.py", NULL);
         }
-        command = g_strdup_printf("python3 \"%s\"\n", script_path);
+        command = g_strdup_printf("%s \"%s\"\n", py_bin, script_path);
     } else {
         // Handle custom scripts
         gchar *scripts_dir = get_scripts_directory();
         if (scripts_dir) {
             script_path = g_build_filename(scripts_dir, action, NULL);
             if (g_str_has_suffix(action, ".py")) {
-                command = g_strdup_printf("python3 \"%s\"\n", script_path);
+                command = g_strdup_printf("%s \"%s\"\n", py_bin, script_path);
             } else if (g_str_has_suffix(action, ".sh")) {
                 command = g_strdup_printf("bash \"%s\"\n", script_path);
             } else if (g_file_test(script_path, G_FILE_TEST_IS_EXECUTABLE)) {

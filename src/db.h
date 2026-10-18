@@ -24,6 +24,9 @@ int session_get_current(void);
 void session_set_current(int session_id);
 GPtrArray* session_list_saved(void);
 char* session_get_name(int session_id);
+bool session_rename(int session_id, const char *name);
+bool session_delete(int session_id);
+int session_note_count(int session_id);
 
 // Terminal Tracking
 int terminal_register(int session_id, int parent_id, const char *pty_name);

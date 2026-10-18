@@ -257,11 +257,11 @@ CREATE TABLE commands (
     exit_code INTEGER,
     FOREIGN KEY (terminal_id) REFERENCES terminals(id)
 );
-\`\`\`
+```
 
 #### ai_messages
 Stores AI chat history (alternative to JSON files).
-\`\`\`sql
+```sql
 CREATE TABLE ai_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id TEXT NOT NULL,
@@ -269,15 +269,46 @@ CREATE TABLE ai_messages (
     content TEXT NOT NULL,
     timestamp TEXT NOT NULL
 );
-\`\`\`
+```
+
+#### notes
+Stores user notes created in the Markdown Notes editor.
+```sql
+CREATE TABLE notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT 'Untitled Note',
+    content TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    modified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+```
+
+#### note_images
+Stores screen captures and inline images inserted into notes.
+```sql
+CREATE TABLE note_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    image_data BLOB NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    width INTEGER DEFAULT 450,
+    alignment TEXT DEFAULT 'center',
+    FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+);
+```
 
 ### Relationships
-\`\`\`mermaid
+```mermaid
 erDiagram
     sessions ||--o{ terminals : contains
     terminals ||--o{ commands : logs
     terminals ||--o{ terminals : "split from"
-\`\`\`
+    sessions ||--o{ notes : contains
+    notes ||--o{ note_images : embeds
+```
 
 ## WebView Integration
 

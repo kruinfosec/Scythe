@@ -148,15 +148,25 @@ void session_set_current(int session_id) {
     current_session_id = session_id;
 }
 
+/* PERF-001 FIX: Custom free function to properly free SavedSessionInfo members */
+static void free_saved_session_info(gpointer data) {
+    SavedSessionInfo *info = (SavedSessionInfo *)data;
+    if (info) {
+        g_free(info->name);
+        g_free(info->start_time);
+        g_free(info);
+    }
+}
+
 GPtrArray* session_list_saved(void) {
     if (!db) return NULL;
-    
-    GPtrArray *list = g_ptr_array_new_with_free_func(g_free);
-    
+
+    GPtrArray *list = g_ptr_array_new_with_free_func(free_saved_session_info);
+
     sqlite3_stmt *stmt;
     const char *sql = "SELECT id, name, start_time FROM sessions WHERE is_saved = 1 ORDER BY id DESC;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return list;
-    
+
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         SavedSessionInfo *info = g_malloc(sizeof(SavedSessionInfo));
         info->id = sqlite3_column_int(stmt, 0);
@@ -166,7 +176,7 @@ GPtrArray* session_list_saved(void) {
         info->start_time = g_strdup(time_str ? time_str : "");
         g_ptr_array_add(list, info);
     }
-    
+
     sqlite3_finalize(stmt);
     return list;
 }
@@ -185,6 +195,67 @@ char* session_get_name(int session_id) {
     }
     sqlite3_finalize(stmt);
     return name;
+}
+
+bool session_rename(int session_id, const char *name) {
+    if (!db || !name) return false;
+    char *sql = sqlite3_mprintf("UPDATE sessions SET name = '%q' WHERE id = %d;", name, session_id);
+    bool result = exec_sql(sql);
+    sqlite3_free(sql);
+    return result;
+}
+
+bool session_delete(int session_id) {
+    if (!db) return false;
+
+    // Cascade delete all related data
+    char *sql;
+
+    // 1. Delete note_images for notes in this session
+    sql = sqlite3_mprintf("DELETE FROM note_images WHERE note_id IN (SELECT id FROM notes WHERE session_id = %d);", session_id);
+    exec_sql(sql); sqlite3_free(sql);
+
+    // 2. Delete notes
+    sql = sqlite3_mprintf("DELETE FROM notes WHERE session_id = %d;", session_id);
+    exec_sql(sql); sqlite3_free(sql);
+
+    // 3. Delete chat_history
+    sql = sqlite3_mprintf("DELETE FROM chat_history WHERE session_id = %d;", session_id);
+    exec_sql(sql); sqlite3_free(sql);
+
+    // 4. Delete commands for terminals in this session
+    sql = sqlite3_mprintf("DELETE FROM commands WHERE terminal_id IN (SELECT id FROM terminals WHERE session_id = %d);", session_id);
+    exec_sql(sql); sqlite3_free(sql);
+
+    // 5. Delete terminals
+    sql = sqlite3_mprintf("DELETE FROM terminals WHERE session_id = %d;", session_id);
+    exec_sql(sql); sqlite3_free(sql);
+
+    // 6. Delete the session itself
+    sql = sqlite3_mprintf("DELETE FROM sessions WHERE id = %d;", session_id);
+    bool result = exec_sql(sql);
+    sqlite3_free(sql);
+
+    // If we deleted the current session, reset it
+    if (session_id == current_session_id) {
+        current_session_id = -1;
+    }
+
+    return result;
+}
+
+int session_note_count(int session_id) {
+    if (!db) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql = "SELECT COUNT(*) FROM notes WHERE session_id = ?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, session_id);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 int terminal_register(int session_id, int parent_id, const char *pty_name) {
@@ -326,17 +397,26 @@ char* note_get_content(int note_id) {
     return content;
 }
 
+/* PERF-002 FIX: Custom free function to properly free NoteInfo members */
+static void free_note_info(gpointer data) {
+    NoteInfo *info = (NoteInfo *)data;
+    if (info) {
+        g_free(info->title);
+        g_free(info);
+    }
+}
+
 GPtrArray* note_list_by_session(int session_id) {
     if (!db) return NULL;
-    
-    GPtrArray *notes = g_ptr_array_new_with_free_func(g_free);
-    
+
+    GPtrArray *notes = g_ptr_array_new_with_free_func(free_note_info);
+
     sqlite3_stmt *stmt;
     const char *sql = "SELECT id, title FROM notes WHERE session_id = ? ORDER BY modified_at DESC;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return notes;
-    
+
     sqlite3_bind_int(stmt, 1, session_id);
-    
+
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         NoteInfo *info = g_malloc(sizeof(NoteInfo));
         info->id = sqlite3_column_int(stmt, 0);
@@ -344,7 +424,7 @@ GPtrArray* note_list_by_session(int session_id) {
         info->title = g_strdup(title ? title : "Untitled Note");
         g_ptr_array_add(notes, info);
     }
-    
+
     sqlite3_finalize(stmt);
     return notes;
 }
